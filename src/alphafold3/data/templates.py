@@ -844,9 +844,9 @@ def get_polymer_features(
 
   if chain.name is None:
     raise ValueError('The structure must have a name.')
-
-  if chain.release_date is None:
-    raise ValueError('The structure must have a release date.')
+  # COMMENTED OUT FOR NOW BECAUSE IT IS NOT PRESENT IN THE TEST PDB FILES
+  # if chain.release_date is None:
+  #   raise ValueError('The structure must have a release date.')
 
   auth_chain_id, label_chain_id = next(
       iter(chain.polymer_auth_asym_id_to_label_asym_id().items())
@@ -873,7 +873,18 @@ def get_polymer_features(
   template_sequence = ''.join(template_sequence)
   template_aatype = _encode_restype(chain_poly_type, template_sequence)
   template_name = f'{chain.name.lower()}_{auth_chain_id}'
-  release_date = chain.release_date.strftime('%Y-%m-%d')
+
+  # Handle potential missing release date from custom/predicted CIFs
+  if chain.release_date is None:
+      # Assign a default old date if release_date is missing
+      release_date = '1970-01-01'
+      logging.warning(
+          f"Template {chain.name} chain {chain.chain_id} missing release"
+          " date. Using default '1970-01-01'."
+      )
+  else:
+      release_date = chain.release_date.strftime('%Y-%m-%d')
+
   return {
       'template_all_atom_positions': template_all_atom_positions,
       'template_all_atom_masks': template_all_atom_masks,

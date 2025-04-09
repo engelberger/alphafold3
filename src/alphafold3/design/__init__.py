@@ -1,0 +1,1 @@
+# AlphaFold 3 design module for binder design and other design applications 

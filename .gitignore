@@ -11,6 +11,7 @@ output/*
 *.sh
 .vscode/launch.json
 out*
+P*.md
 src/alphafold3/constants/converters/ccd.pickle
 src/alphafold3/constants/converters/chemical_component_sets.pickle
 .devcontainer/docker-compose.yml

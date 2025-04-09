@@ -23,6 +23,7 @@ from collections.abc import Callable, Sequence
 import csv
 import dataclasses
 import datetime
+import enum
 import functools
 import multiprocessing
 import os
@@ -55,6 +56,7 @@ from jax import numpy as jnp
 import numpy as np
 from alphafold3.data.custom_utils import parse_mutation_string, apply_mutations_to_input, parse_masking_positions, apply_masking_to_features
 from alphafold3.model import data_constants
+from alphafold3.design import binder_design
 
 _HOME_DIR = pathlib.Path(os.environ.get('HOME'))
 _DEFAULT_MODEL_DIR = _HOME_DIR / 'models'
@@ -268,6 +270,67 @@ _NUM_SEEDS = flags.DEFINE_integer(
     ' random seeds. If not set, AlphaFold 3 will use the seeds as provided in'
     ' the input JSON.',
     lower_bound=1,
+)
+
+# Protocol selection and binder design parameters
+class DesignProtocol(enum.Enum):
+    FOLD = 'fold'                 # Standard prediction
+    BINDER_GRADIENT = 'binder_gradient' # ColabDesign-like approach
+    BINDER_BOLTZ = 'binder_boltz'     # BoltzDesign1 approach
+
+flags.DEFINE_enum_class(
+    'protocol', DesignProtocol.FOLD, DesignProtocol,
+    'The prediction or design protocol to run.'
+)
+_TARGET_CHAINS = flags.DEFINE_list(
+    'target_chains', None,
+    'Comma-separated list of chain IDs to keep fixed (target). Required for binder protocols.'
+)
+_BINDER_CHAINS = flags.DEFINE_list(
+    'binder_chains', None,
+    'Comma-separated list of chain IDs to design (binder). Required for binder protocols.'
+)
+
+# General Design Parameters
+_DESIGN_LEARNING_RATE = flags.DEFINE_float(
+    'design_learning_rate', 0.1, 'Base learning rate for sequence optimization.'
+)
+_DESIGN_STEPS = flags.DEFINE_integer(
+    'design_steps', 200, 'Total optimization steps (used if protocol has one stage).'
+)
+_DESIGN_SEQ_ENTROPY_WEIGHT = flags.DEFINE_float(
+    'design_seq_entropy_weight', 0.01, 'Weight for sequence entropy loss.'
+)
+
+# Gradient-Specific Parameters
+_GRADIENT_PLDDT_WEIGHT = flags.DEFINE_float(
+    'gradient_plddt_weight', 0.5, 'Weight for binder pLDDT loss (gradient protocol).'
+)
+_GRADIENT_PAE_INTER_WEIGHT = flags.DEFINE_float(
+    'gradient_pae_inter_weight', 0.5, 'Weight for interface PAE loss (gradient protocol).'
+)
+_GRADIENT_CONTACT_WEIGHT = flags.DEFINE_float(
+    'gradient_contact_weight', 0.5, 'Weight for interface contact loss (gradient protocol).'
+)
+
+# Boltz-Specific Parameters
+_BOLTZ_STAGE1_STEPS = flags.DEFINE_integer(
+    'boltz_stage1_steps', 50, 'Steps for BoltzDesign1 Stage 1 (exploration).'
+)
+_BOLTZ_STAGE2_STEPS = flags.DEFINE_integer(
+    'boltz_stage2_steps', 50, 'Steps for BoltzDesign1 Stage 2 (transition).'
+)
+_BOLTZ_STAGE3_STEPS = flags.DEFINE_integer(
+    'boltz_stage3_steps', 50, 'Steps for BoltzDesign1 Stage 3 (convergence).'
+)
+_BOLTZ_STAGE4_STEPS = flags.DEFINE_integer(
+    'boltz_stage4_steps', 50, 'Steps for BoltzDesign1 Stage 4 (one-hot).'
+)
+_BOLTZ_DISTOGRAM_WEIGHT = flags.DEFINE_float(
+    'boltz_distogram_weight', 1.0, 'Weight for distogram contact loss (Boltz protocol).'
+)
+_BOLTZ_CONFIDENCE_WEIGHT = flags.DEFINE_float(
+    'boltz_confidence_weight', 0.5, 'Weight for confidence loss (pLDDT/PAE) (Boltz protocol).'
 )
 
 # Output controls.
@@ -589,6 +652,7 @@ def process_fold_input(
     output_dir: os.PathLike[str] | str,
     mutations_str: Optional[str],
     masking_config: Dict[str, Any],
+    design_params: Optional[Dict[str, Any]] = None,
     buckets: Sequence[int] | None = None,
     ref_max_modified_date: datetime.date | None = None,
     conformer_max_iterations: int | None = None,
@@ -605,6 +669,7 @@ def process_fold_input(
     output_dir: os.PathLike[str] | str,
     mutations_str: Optional[str],
     masking_config: Dict[str, Any],
+    design_params: Optional[Dict[str, Any]] = None,
     buckets: Sequence[int] | None = None,
     ref_max_modified_date: datetime.date | None = None,
     conformer_max_iterations: int | None = None,
@@ -620,6 +685,7 @@ def process_fold_input(
     output_dir: os.PathLike[str] | str,
     mutations_str: Optional[str],
     masking_config: Dict[str, Any],
+    design_params: Optional[Dict[str, Any]] = None,
     buckets: Sequence[int] | None = None,
     ref_max_modified_date: datetime.date | None = None,
     conformer_max_iterations: int | None = None,
@@ -635,6 +701,7 @@ def process_fold_input(
     output_dir: Output directory to write to.
     mutations_str: Optional string defining mutations to apply.
     masking_config: Dictionary with masking parameters.
+    design_params: Optional dictionary with design parameters.
     buckets: Bucket sizes to pad the data to, to avoid excessive re-compilation
       of the model. If None, calculate the appropriate bucket size from the
       number of tokens. If not None, must be a sequence of at least one integer,
@@ -706,27 +773,131 @@ def process_fold_input(
     logging.info("Skipping model inference as model_runner is None.")
     output = fold_input
   else:
-    print(
-        f'Predicting 3D structure for {fold_input.name} with'
-        f' {len(fold_input.rng_seeds)} seed(s)...'
-    )
-    logging.info(f"Starting structure prediction for {fold_input.name} with {len(fold_input.rng_seeds)} seeds.")
-    all_inference_results = predict_structure(
-        fold_input=fold_input,
-        model_runner=model_runner,
-        buckets=buckets,
-        ref_max_modified_date=ref_max_modified_date,
-        conformer_max_iterations=conformer_max_iterations,
-        masking_config=masking_config,
-    )
-    print(f'Writing outputs with {len(fold_input.rng_seeds)} seed(s)...')
-    logging.info(f"Writing outputs for {fold_input.name}.")
-    write_outputs(
-        all_inference_results=all_inference_results,
-        output_dir=output_dir,
-        job_name=fold_input.sanitised_name(),
-    )
-    output = all_inference_results
+    # Check if we're running a binder design protocol
+    if design_params is not None and design_params.get("protocol") in ["binder_gradient", "binder_boltz"]:
+      print(f'Designing binder for {fold_input.name} using {design_params["protocol"]} protocol...')
+      logging.info(f"Starting binder design for {fold_input.name} with protocol {design_params['protocol']}")
+      
+      # Get CCD
+      ccd = chemical_components.cached_ccd(user_ccd=fold_input.user_ccd)
+      
+      # Featurize the input (same as for prediction)
+      featurisation_start_time = time.time()
+      featurised_examples = featurisation.featurise_input(
+          fold_input=fold_input,
+          buckets=buckets,
+          ccd=ccd,
+          verbose=True,
+          ref_max_modified_date=ref_max_modified_date,
+          conformer_max_iterations=conformer_max_iterations,
+          masking_config=masking_config,
+      )
+      print(
+          f'Featurising data for design took'
+          f' {time.time() - featurisation_start_time:.2f} seconds.'
+      )
+      
+      # Get the first featurized example (we only need one for design)
+      feature_dict = featurised_examples[0]
+      
+      # Run the design
+      design_results, final_model_result = binder_design.design_binder(
+          fold_input=fold_input,
+          feature_dict=feature_dict,
+          model_runner=model_runner,
+          ccd=ccd,
+          design_params=design_params,
+          rng_seed=fold_input.rng_seeds[0],
+          buckets=buckets,
+          ref_max_modified_date=ref_max_modified_date,
+          conformer_max_iterations=conformer_max_iterations,
+          use_complete_prediction=True  # Use complete prediction pipeline
+      )
+      
+      # Create results for each seed (for compatibility with standard output code)
+      # Here we're repurposing the standard AlphaFold output format
+      inference_results, embeddings = model_runner.extract_inference_results_and_maybe_embeddings(
+          batch=feature_dict, result=final_model_result, target_name=fold_input.name
+      )
+      
+      # Create ResultsForSeed with the final prediction
+      all_inference_results = [
+          ResultsForSeed(
+              seed=fold_input.rng_seeds[0],
+              inference_results=inference_results,
+              full_fold_input=fold_input,
+              embeddings=embeddings if _SAVE_EMBEDDINGS.value else None
+          )
+      ]
+      
+      # Write design-specific outputs
+      print(f'Writing design outputs...')
+      os.makedirs(output_dir, exist_ok=True)
+      
+      # Save the design results as JSON
+      import json
+      design_output_path = os.path.join(output_dir, f'{fold_input.sanitised_name()}_design_results.json')
+      with open(design_output_path, 'w') as f:
+          # Convert arrays to lists for JSON serialization
+          json_safe_results = {}
+          for k, v in design_results.items():
+              if k == 'trajectory':
+                  # Special handling for trajectory to make it JSON-serializable
+                  json_safe_trajectory = {}
+                  for tk, tv in v.items():
+                      if tk == 'losses':
+                          # Losses is a list of dicts with float values
+                          json_safe_trajectory[tk] = tv
+                      elif tk == 'sequences':
+                          # Sequences is a list of strings
+                          json_safe_trajectory[tk] = tv
+                      else:
+                          # Convert numpy arrays to lists
+                          json_safe_trajectory[tk] = [float(val) for val in tv]
+                  json_safe_results[k] = json_safe_trajectory
+              elif k in ['target_indices', 'binder_indices', 'final_seq_logits', 'final_aa_indices']:
+                  # Skip these large arrays from the JSON output
+                  continue
+              elif k == 'best_feature_dict':
+                  # Skip the feature dict from JSON output
+                  continue
+              else:
+                  # Keep other items as they are (protocol, best_loss, design_time)
+                  json_safe_results[k] = v
+          
+          json.dump(json_safe_results, f, indent=2)
+      
+      # Standard output writing
+      write_outputs(
+          all_inference_results=all_inference_results,
+          output_dir=output_dir,
+          job_name=fold_input.sanitised_name(),
+      )
+      
+      output = all_inference_results
+    else:
+      # Standard prediction workflow
+      print(
+          f'Predicting 3D structure for {fold_input.name} with'
+          f' {len(fold_input.rng_seeds)} seed(s)...'
+      )
+      logging.info(f"Starting structure prediction for {fold_input.name} with {len(fold_input.rng_seeds)} seeds.")
+      all_inference_results = predict_structure(
+          fold_input=fold_input,
+          model_runner=model_runner,
+          buckets=buckets,
+          ref_max_modified_date=ref_max_modified_date,
+          conformer_max_iterations=conformer_max_iterations,
+          masking_config=masking_config,
+      )
+      print(f'Writing outputs with {len(fold_input.rng_seeds)} seed(s)...')
+      logging.info(f"Writing outputs for {fold_input.name}.")
+      write_outputs(
+          all_inference_results=all_inference_results,
+          output_dir=output_dir,
+          job_name=fold_input.sanitised_name(),
+      )
+      output = all_inference_results
 
   print(f'Fold job {fold_input.name} done, output written to {output_dir}\n')
   logging.info(f"Fold job {fold_input.name} finished. Output at: {output_dir}")
@@ -923,6 +1094,46 @@ def main(_):
   logging.info(f"Masking configuration prepared: {masking_config}")
   # ----------------------------
 
+  # --- Prepare Design Parameters ---
+  design_params = None
+  if FLAGS.protocol in [DesignProtocol.BINDER_GRADIENT, DesignProtocol.BINDER_BOLTZ]:
+    if not FLAGS.target_chains:
+      raise app.UsageError("--target_chains required for binder protocols.")
+    if not FLAGS.binder_chains:
+      raise app.UsageError("--binder_chains required for binder protocols.")
+
+    design_params = {
+        "protocol": FLAGS.protocol.value,
+        "target_chains": FLAGS.target_chains,
+        "binder_chains": FLAGS.binder_chains,
+        "lr": FLAGS.design_learning_rate,
+        "weights": {"seq_entropy": FLAGS.design_seq_entropy_weight}
+    }
+
+    if FLAGS.protocol == DesignProtocol.BINDER_GRADIENT:
+        logging.info(f"Running Gradient Binder Design: Target={FLAGS.target_chains}, Binder={FLAGS.binder_chains}")
+        design_params["steps"] = FLAGS.design_steps
+        design_params["weights"].update({
+            "plddt": FLAGS.gradient_plddt_weight,
+            "pae_inter": FLAGS.gradient_pae_inter_weight,
+            "contact": FLAGS.gradient_contact_weight,
+        })
+    elif FLAGS.protocol == DesignProtocol.BINDER_BOLTZ:
+        logging.info(f"Running BoltzDesign1 Binder Protocol: Target={FLAGS.target_chains}, Binder={FLAGS.binder_chains}")
+        design_params["stages"] = [
+            FLAGS.boltz_stage1_steps,
+            FLAGS.boltz_stage2_steps,
+            FLAGS.boltz_stage3_steps,
+            FLAGS.boltz_stage4_steps
+        ]
+        design_params["weights"].update({
+            "distogram": FLAGS.boltz_distogram_weight,
+            "confidence": FLAGS.boltz_confidence_weight,
+        })
+  else:
+    logging.info("Running standard folding protocol.")
+  # ---------------------------
+
   # --- Process Each Input ---
   num_fold_inputs_processed = 0
   total_start_time = time.time()
@@ -943,6 +1154,8 @@ def main(_):
         # --- Pass mutation/masking args ---
         mutations_str=FLAGS.mutations,
         masking_config=masking_config,
+        # --- Pass design params ---
+        design_params=design_params,
         # ----------------------------------
         buckets=tuple(int(bucket) for bucket in _BUCKETS.value),
         ref_max_modified_date=max_template_date,
