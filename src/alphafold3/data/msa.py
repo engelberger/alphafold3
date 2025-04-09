@@ -198,24 +198,39 @@ class Msa:
   @classmethod
   def from_a3m(
       cls,
+      a3m: str | None,
+      *,
       query_sequence: str,
       chain_poly_type: str,
-      a3m: str,
-      max_depth: int | None = None,
-      deduplicate: bool = True,
+      max_sequences: int | None = None,
+      deduplicate: bool = False,
   ) -> Self:
-    """Parses the single A3M and builds the Msa object."""
-    sequences, descriptions = parsers.parse_fasta(a3m)
+    """Constructs an Msa object from an A3M string."""
+    # Handle None or empty input string
+    if not a3m:
+        logging.warning(
+            f"Input A3M string is None or empty for query sequence starting with "
+            f"'{query_sequence[:20]}...'. Returning an empty MSA."
+        )
+        return cls.from_empty(query_sequence, chain_poly_type)
 
-    if max_depth is not None and 0 < max_depth < len(sequences):
+    sequences, descriptions = parsers.parse_fasta(a3m)
+    if not sequences:
+      raise ValueError('Found no sequences in A3M.')
+    if sequences[0] != query_sequence:
+      raise ValueError(
+          'First MSA sequence %s is not the query_sequence=%r' %
+          (sequences[0], query_sequence))
+
+    if max_sequences is not None and 0 < max_sequences < len(sequences):
       logging.info(
           'MSA cropped from depth of %d to %d for %s.',
           len(sequences),
-          max_depth,
+          max_sequences,
           query_sequence,
       )
-      sequences = sequences[:max_depth]
-      descriptions = descriptions[:max_depth]
+      sequences = sequences[:max_sequences]
+      descriptions = descriptions[:max_sequences]
 
     return cls(
         query_sequence=query_sequence,
