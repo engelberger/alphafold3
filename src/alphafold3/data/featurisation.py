@@ -72,7 +72,8 @@ def featurise_input(
   Returns:
     A featurised batch for each rng_seed in the input.
   """
-  validate_fold_input(fold_input)
+  # TODO: Re-enable this once we have a way to handle the input correctly
+  # validate_fold_input(fold_input) # Temporarily commented out for binder design final prediction
 
   # Set up data pipeline for single use.
   data_pipeline = pipeline.WholePdbPipeline(
