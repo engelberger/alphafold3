@@ -30,6 +30,7 @@ from alphafold3.structure import mmcif
 from alphafold3.structure import structure
 from alphafold3.structure import structure_tables
 import numpy as np
+from absl import logging # Ensure logging is imported
 
 
 ChainIndex: TypeAlias = int
@@ -132,6 +133,21 @@ def _get_first_non_leaving_atom(
     ccd: chemical_components.Ccd, res_name: str
 ) -> str:
   """Returns first definitely non-leaving atom if exists, as a stand-in."""
+  # --- Add Diagnostic Logging ---
+  logging.info(f"Attempting to get atoms for res_name: '{res_name}'")
+  ccd_entry = ccd.get(res_name)
+  logging.info(f"Result of ccd.get('{res_name}'): {'Found' if ccd_entry else 'None'}")
+  if not ccd_entry:
+      # Log sample keys if lookup fails
+      try:
+          sample_keys = list(ccd.keys())[:10] + list(ccd.keys())[-10:]
+          logging.warning(f"CCD lookup failed for '{res_name}'. Sample CCD keys: {sample_keys}")
+          # Check specifically for 'D' and 'A'
+          logging.warning(f"ccd.get('D') is {'Found' if ccd.get('D') else 'None'}")
+          logging.warning(f"ccd.get('A') is {'Found' if ccd.get('A') else 'None'}")
+      except Exception as e:
+          logging.error(f"Error while inspecting CCD keys: {e}")
+  # --- End Diagnostic Logging ---
   all_atoms = struc_chem_comps.get_all_atoms_in_entry(ccd, res_name=res_name)[
       '_chem_comp_atom.atom_id'
   ]

@@ -487,8 +487,8 @@ class BinderDesigner:
         fold_input: folding_input.Input,
         design_results: Dict[str, Any],
         rng_key: jnp.ndarray,
-    ) -> model.ModelResult:
-        """Run a final prediction with the designed sequence.
+    ) -> Tuple[model.ModelResult, features.BatchDict, folding_input.Input]:
+        """Run a final prediction with the designed sequence (Simplified).
         
         Args:
             fold_input: The original input to AlphaFold.
@@ -496,9 +496,9 @@ class BinderDesigner:
             rng_key: JAX random key.
             
         Returns:
-            Full model result from the final prediction.
+            Tuple of (model_result, final_feature_dict, new_fold_input).
         """
-        logging.info("Running final prediction with designed sequence...")
+        logging.info("Running final prediction with designed sequence (Simplified Method)...")
         
         # Get the final amino acid indices from the design results
         final_aa_indices = design_results["final_aa_indices"]
@@ -547,13 +547,13 @@ class BinderDesigner:
                         id=chain.id,
                         sequence=new_sequence,
                         ptms=chain.ptms,  # Keep the original PTMs
-                        # Clear MSA and templates to force re-search with designed sequence
+                        # Clear MSA and set templates to empty list to force re-search
                         unpaired_msa=None, 
                         paired_msa=None,
-                        templates=None
+                        templates=[] # Use empty list instead of None
                     )
                     new_chains.append(new_chain)
-                    logging.info(f"Replaced binder chain {chain.id} sequence and cleared MSAs/templates.")
+                    logging.info(f"Replaced binder chain {chain.id} sequence and reset MSAs/templates.")
                 else:
                     # Something went wrong - use the original chain
                     logging.warning(f"No designed sequence for binder chain {chain.id}, using original")
@@ -571,14 +571,9 @@ class BinderDesigner:
             user_ccd=fold_input.user_ccd
         )
         
-        logging.info("Created new input with designed binder sequence")
+        logging.info("Created new input with designed binder sequence (Simplified Method)")
         
-        # Now run a standard prediction on this new input
-        # Two options here:
-        # 1. Create a new feature dictionary from scratch (more complete)
-        # 2. Use the existing feature dictionary and update it (faster)
-        
-        # For now, we'll use the faster approach by updating the existing feature dictionary
+        # Use the best feature dict from design results and update it
         final_feature_dict = binder_utils.update_features_from_logits(
             design_results["best_feature_dict"].copy(),
             design_results["binder_indices"],
@@ -586,17 +581,17 @@ class BinderDesigner:
         )
         
         # Run standard prediction
-        logging.info("Running inference on designed sequence...")
+        logging.info("Running inference on designed sequence (Simplified Method)...")
         final_result = self.model_runner.run_inference(final_feature_dict, rng_key)
         
-        logging.info("Final prediction complete")
+        logging.info("Final prediction complete (Simplified Method)")
         
-        # Add designed sequence to the result metadata for easier reference
+        # Add designed sequence to the result metadata
         if isinstance(final_result, dict) and "metadata" in final_result:
             final_result["metadata"]["designed_sequence"] = designed_sequence
             final_result["metadata"]["designed_binder_chains"] = binder_chains
         
-        return final_result
+        return final_result, final_feature_dict, new_fold_input
 
     def run_complete_prediction(
         self,
@@ -606,7 +601,7 @@ class BinderDesigner:
         buckets: Sequence[int] | None = None,
         ref_max_modified_date: datetime.date | None = None,
         conformer_max_iterations: int | None = None,
-    ) -> model.ModelResult:
+    ) -> Tuple[model.ModelResult, features.BatchDict, folding_input.Input]:
         """Run a complete prediction pipeline with the designed sequence.
         
         This is a more comprehensive prediction method that creates a new input
@@ -621,7 +616,7 @@ class BinderDesigner:
             conformer_max_iterations: Optional iterations for conformer generation.
             
         Returns:
-            Full model result from the final prediction.
+            Tuple of (model_result, final_feature_dict, new_fold_input).
         """
         logging.info("Running complete prediction with designed sequence...")
         
@@ -672,13 +667,13 @@ class BinderDesigner:
                         id=chain.id,
                         sequence=new_sequence,
                         ptms=chain.ptms,  # Keep the original PTMs
-                        # Clear MSA and templates to force re-search with designed sequence
+                        # Clear MSA and set templates to empty list to force re-search
                         unpaired_msa=None, 
                         paired_msa=None,
-                        templates=None
+                        templates=[] # Use empty list instead of None
                     )
                     new_chains.append(new_chain)
-                    logging.info(f"Replaced binder chain {chain.id} sequence and cleared MSAs/templates.")
+                    logging.info(f"Replaced binder chain {chain.id} sequence and reset MSAs/templates.")
                 else:
                     # Something went wrong - use the original chain
                     logging.warning(f"No designed sequence for binder chain {chain.id}, using original")
@@ -726,19 +721,20 @@ class BinderDesigner:
             
             logging.info("Complete prediction finished successfully")
             
-            # Add designed sequence to the result metadata for easier reference
+            # Add designed sequence metadata
             if isinstance(final_result, dict) and "metadata" in final_result:
                 final_result["metadata"]["designed_sequence"] = designed_sequence
                 final_result["metadata"]["designed_binder_chains"] = binder_chains
                 
-            return final_result
+            return final_result, final_feature_dict, new_fold_input
             
         except ImportError as e:
             logging.warning(f"Could not run complete prediction: {str(e)}")
             logging.warning("Falling back to simplified prediction method")
             
             # Fall back to the simpler approach
-            return self.run_final_prediction(fold_input, design_results, rng_key)
+            final_result_simple, final_feature_dict_simple, new_fold_input_simple = self.run_final_prediction(fold_input, design_results, rng_key)
+            return final_result_simple, final_feature_dict_simple, new_fold_input_simple
 
 
 def design_binder(
@@ -752,7 +748,7 @@ def design_binder(
     ref_max_modified_date: datetime.date | None = None,
     conformer_max_iterations: int | None = None,
     use_complete_prediction: bool = True,
-) -> Tuple[Dict[str, Any], model.ModelResult]:
+) -> Tuple[Dict[str, Any], model.ModelResult, features.BatchDict, folding_input.Input]:
     """Design a binder protein using AlphaFold 3.
     
     Args:
@@ -768,7 +764,7 @@ def design_binder(
         use_complete_prediction: Whether to use the comprehensive prediction method.
         
     Returns:
-        Tuple of (design_results, final_model_result).
+        Tuple of (design_results, final_model_result, final_feature_dict, new_fold_input).
     """
     rng_key = jax.random.PRNGKey(rng_seed)
     
@@ -782,13 +778,15 @@ def design_binder(
     
     # Store best feature dict for final prediction
     design_results["best_feature_dict"] = best_feature_dict
+    design_results["binder_indices"] = designer.design_params.get("binder_indices")
+    design_results["final_seq_logits"] = design_results.get("final_seq_logits")
     
     # Run final prediction
     final_key, _ = jax.random.split(rng_key)
     
     # Choose which final prediction method to use
     if use_complete_prediction:
-        final_result = designer.run_complete_prediction(
+        final_model_result, final_feature_dict, new_fold_input = designer.run_complete_prediction(
             fold_input, 
             design_results, 
             final_key,
@@ -797,8 +795,8 @@ def design_binder(
             conformer_max_iterations=conformer_max_iterations
         )
     else:
-        final_result = designer.run_final_prediction(
+        final_model_result, final_feature_dict, new_fold_input = designer.run_final_prediction(
             fold_input, design_results, final_key
         )
     
-    return design_results, final_result 
+    return design_results, final_model_result, final_feature_dict, new_fold_input 

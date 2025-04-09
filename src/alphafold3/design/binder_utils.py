@@ -103,71 +103,61 @@ def setup_binder_features(feature_dict, target_chains, binder_chains, fold_input
         logging.error("Available feature dict keys: " + str(list(feature_dict.keys())))
         raise KeyError(f"Feature '{chain_id_key}' or 'asym_id' needed for binder setup not found.")
         
-    # --- Create mapping from integer asym_id to string chain ID --- 
-    # Robust approach: Map based on residue ranges from input chains
-    int_to_str_chain_map = {}
+    # --- Determine target/binder indices directly from input chain order and lengths --- 
+    target_idx = []
+    binder_idx = []
     current_index = 0
-    all_found_int_ids = set()
+    logging.info("Assigning target/binder indices based on input chain order and lengths...")
+
     for chain in fold_input.chains:
-        if not hasattr(chain, 'id') or not hasattr(chain, 'sequence'):
-            logging.warning(f"Skipping chain in mapping creation as it lacks id or sequence: {chain}")
-            continue
-        chain_id_str = chain.id
-        chain_len = len(chain.sequence)
-        end_index = current_index + chain_len
-        
-        # Ensure indices are within the bounds of int_asym_ids
-        if end_index > len(int_asym_ids):
-            logging.error(f"Chain {chain_id_str} end index ({end_index}) exceeds feature length ({len(int_asym_ids)}). Cannot map correctly.")
-            break # Stop mapping if lengths don't match
-            
-        # Find the unique integer ID(s) in this residue range
-        ids_in_range = np.unique(int_asym_ids[current_index:end_index])
-        
-        if len(ids_in_range) == 1:
-            int_id = int(ids_in_range[0]) # Convert numpy int to Python int
-            if int_id in int_to_str_chain_map and int_to_str_chain_map[int_id] != chain_id_str:
-                logging.warning(f"Integer ID {int_id} already mapped to {int_to_str_chain_map[int_id]}, but also found for chain {chain_id_str}. Overwriting.")
-            int_to_str_chain_map[int_id] = chain_id_str
-            all_found_int_ids.add(int_id)
-        elif len(ids_in_range) == 0:
-             logging.warning(f"No integer asym_ids found in range [{current_index}:{end_index}] for chain {chain_id_str}.")
+        chain_id_str = chain.id # Get string ID regardless of type
+
+        if isinstance(chain, (folding_input.ProteinChain, folding_input.RnaChain, folding_input.DnaChain)):
+            if not hasattr(chain, 'sequence'):
+                 logging.warning(f"Skipping chain {chain_id_str} in index assignment as it lacks sequence.")
+                 continue
+            chain_len = len(chain.sequence)
+        elif isinstance(chain, folding_input.Ligand):
+            # Ligands defined by ccd_ids are treated as single residues per ID
+            chain_len = len(chain.ccd_ids) if chain.ccd_ids else (1 if chain.smiles else 0)
+            if chain_len == 0:
+                 logging.warning(f"Skipping ligand chain {chain_id_str} as it has no ccd_ids or smiles.")
+                 continue
         else:
-            logging.warning(f"Multiple integer asym_ids ({ids_in_range}) found in range [{current_index}:{end_index}] for chain {chain_id_str}. Using first ID {ids_in_range[0]}. Mapping might be incorrect.")
-            int_id = int(ids_in_range[0])
-            if int_id in int_to_str_chain_map and int_to_str_chain_map[int_id] != chain_id_str:
-                 logging.warning(f"Integer ID {int_id} (first of multiple) already mapped to {int_to_str_chain_map[int_id]}, but also found for chain {chain_id_str}. Overwriting.")
-            int_to_str_chain_map[int_id] = chain_id_str
-            all_found_int_ids.add(int_id)
+            logging.warning(f"Skipping unknown chain type in index assignment: {type(chain)}")
+            continue
+        
+        end_index = current_index + chain_len
+        chain_indices = list(range(current_index, min(end_index, len(int_asym_ids)))) # Ensure we don't go out of bounds
+
+        if not chain_indices: # Skip if the chain has zero length or starts out of bounds
+            logging.warning(f"Chain {chain_id_str} resulted in no valid indices in range [{current_index}:{end_index}]. Skipping.")
+            current_index = end_index
+            continue
+
+        if chain_id_str in target_chains:
+            target_idx.extend(chain_indices)
+            logging.info(f"Assigned indices {chain_indices[0]}...{chain_indices[-1]} to TARGET chain '{chain_id_str}'.")
+        elif chain_id_str in binder_chains:
+            binder_idx.extend(chain_indices)
+            logging.info(f"Assigned indices {chain_indices[0]}...{chain_indices[-1]} to BINDER chain '{chain_id_str}'.")
+        else:
+            logging.info(f"Skipping indices {chain_indices[0]}...{chain_indices[-1]} for non-target/binder chain '{chain_id_str}'.")
             
         current_index = end_index
 
-    # Log any unmapped integer IDs found in the full array
-    all_int_ids_in_features = set(np.unique(int_asym_ids).astype(int))
-    unmapped_ids = all_int_ids_in_features - all_found_int_ids
-    if unmapped_ids:
-        logging.warning(f"The following integer asym_ids exist in features but were not mapped based on input chain ranges: {unmapped_ids}. These might belong to padding or indicate an issue.")
+    target_indices = np.array(target_idx)
+    binder_indices = np.array(binder_idx)
 
-    # unique_int_ids = sorted(np.unique(int_asym_ids))
-    # original_chain_ids = [chain.id for chain in fold_input.chains if hasattr(chain, 'id')]
-    
-    # if len(unique_int_ids) != len(original_chain_ids):
-    #     logging.warning(
-    #         f"Mismatch between unique integer asym_ids ({len(unique_int_ids)}) "
-    #         f"and number of chains in input ({len(original_chain_ids)}). "
-    #         f"Mapping might be incorrect."
-    #     )
-    #     # Attempt simple 1-to-1 mapping anyway, might work for simple cases
-    #     int_to_str_chain_map = {int_id: str_id for int_id, str_id in zip(unique_int_ids, original_chain_ids)}
-    # else:
-    #     int_to_str_chain_map = {int_id: str_id for int_id, str_id in zip(unique_int_ids, original_chain_ids)}
-    logging.info(f"Created integer-to-string chain map: {int_to_str_chain_map}")
-    # --- End Mapping --- 
-    
-    target_indices, binder_indices = get_residue_indices(
-        int_asym_ids, target_chains, binder_chains, int_to_str_chain_map
-    )
-    
+    if target_indices.size == 0:
+        raise ValueError(f"Could not assign any residue indices to target chains {target_chains}. Check input and logs.")
+    if binder_indices.size == 0:
+        raise ValueError(f"Could not assign any residue indices to binder chains {binder_chains}. Check input and logs.")
+
+    logging.info(f"Final Target indices ({len(target_indices)}): {target_indices[:5]}...{target_indices[-5:] if len(target_indices) > 5 else target_indices}")
+    logging.info(f"Final Binder indices ({len(binder_indices)}): {binder_indices[:5]}...{binder_indices[-5:] if len(binder_indices) > 5 else binder_indices}")
+    # --- End Index Assignment --- 
+
     # Add Design Mask
     # Check for the actual key 'seq_mask' first, then fallbacks
     if 'seq_mask' in feature_dict:
