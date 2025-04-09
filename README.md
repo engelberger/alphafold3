@@ -260,3 +260,17 @@ available with reference to the following:
     See the Supplementary Information of the
     [AlphaFold 3 paper](https://nature.com/articles/s41586-024-07487-w) for
     details.
+---------------------
+for the dev container if the installation is editable this two pkl files will not be generated in the dev directory so make sure to copy them to the src/alphafold3/constants/converters/ directory 
+root@5f28bc578896:/app/alphafold# build_data 
+Parsing /alphafold3_venv/lib/python3.11/site-packages/share/libcifpp/components.cif
+100%|█████████████████████████████████████████████████████████████████████████████████████████████| 46509/46509 [00:04<00:00, 11072.07it/s]
+Writing /alphafold3_venv/lib/python3.11/site-packages/alphafold3/constants/converters/ccd.pickle
+Done
+Loading /app/alphafold/src/alphafold3/constants/converters/ccd.pickle
+Finding ions and glycans
+100%|████████████████████████████████████████████████████████████████████████████████████████████| 46509/46509 [00:00<00:00, 366099.61it/s]
+writing to /alphafold3_venv/lib/python3.11/site-packages/alphafold3/constants/converters/chemical_component_sets.pickle
+Done
+root@5f28bc578896:/app/alphafold# python run_alphafold.py --json_path=/app/alphafold/input_examples/abc_rfah_input_mmseqs.json --model_dir=/root/models --output_dir=/app/alphafold/output_dev_test --num_diffusion_samples 5 --num_recycles 3 --mask_positions "142,146" --mask_msa --mask_token X^C
+root@5f28bc578896:/app/alphafold# cp /alphafold3_venv/lib/python3.11/site-packages/alphafold3/constants/converters/chemical_component_sets.pickle /app/alphafold/src/alphafold3/constants/converters/

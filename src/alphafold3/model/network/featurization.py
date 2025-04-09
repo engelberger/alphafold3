@@ -129,7 +129,53 @@ def create_msa_feat(msa: features.MSA) -> chex.ArrayDevice:
   return jnp.concatenate(msa_feat, axis=-1)
 
 
+def shuffle_msa(
+    key: jax.Array, msa: features.MSA
+) -> tuple[features.MSA, jax.Array]:
+  """Shuffle MSA rows randomly while preserving valid sequences.
+  
+  This function performs a random permutation of sequences in the MSA,
+  where sequences with at least one non-masked position are equally likely
+  to be included, while sequences with all positions masked are effectively
+  excluded from the shuffling process.
+
+  Args:
+    key: rng key for random number generation.
+    msa: MSA object to shuffle.
+
+  Returns:
+    A tuple containing:
+      - The MSA object with rows reordered according to the random permutation
+      - The updated rng key for subsequent random operations
+  """
+  key, sample_key = jax.random.split(key)
+  # Sample uniformly among sequences with at least one non-masked position.
+  # Sequences with at least one valid position get logit 0, while
+  # sequences with all positions masked get a very negative logit (-1e6).
+  logits = (jnp.clip(jnp.sum(msa.mask, axis=-1), 0.0, 1.0) - 1.0) * 1e6
+  index_order = gumbel_argsort_sample_idx(sample_key, logits)
+
+  return msa.index_msa_rows(index_order), key
+
+
 def truncate_msa_batch(msa: features.MSA, num_msa: int) -> features.MSA:
+  """Truncates an MSA to include only the first num_msa rows.
+  
+  This function selects the first num_msa rows from the MSA without
+  reordering them. It's typically used to reduce computational load by
+  limiting the number of sequences processed in downstream operations.
+  
+  The truncation is performed by selecting indices 0 to (num_msa-1).
+  If num_msa exceeds the number of rows in the MSA, all rows are retained
+  due to jnp.arange behavior.
+
+  Args:
+    msa: MSA object to truncate.
+    num_msa: Number of rows to keep in the MSA.
+
+  Returns:
+    The truncated MSA object containing the first num_msa rows.
+  """
   indices = jnp.arange(num_msa)
   return msa.index_msa_rows(indices)
 
@@ -247,23 +293,3 @@ def create_relative_encoding(
   rel_feats.append(rel_chain)
 
   return jnp.concatenate(rel_feats, axis=-1)
-
-
-def shuffle_msa(
-    key: jax.Array, msa: features.MSA
-) -> tuple[features.MSA, jax.Array]:
-  """Shuffle MSA randomly, return batch with shuffled MSA.
-
-  Args:
-    key: rng key for random number generation.
-    msa: MSA object to sample msa from.
-
-  Returns:
-    Protein with sampled msa.
-  """
-  key, sample_key = jax.random.split(key)
-  # Sample uniformly among sequences with at least one non-masked position.
-  logits = (jnp.clip(jnp.sum(msa.mask, axis=-1), 0.0, 1.0) - 1.0) * 1e6
-  index_order = gumbel_argsort_sample_idx(sample_key, logits)
-
-  return msa.index_msa_rows(index_order), key

@@ -13,13 +13,16 @@
 from collections.abc import Sequence
 import datetime
 import time
+from typing import Optional, Dict, Any
 
 from alphafold3.common import folding_input
 from alphafold3.constants import chemical_components
 from alphafold3.model import features
 from alphafold3.model.pipeline import pipeline
 import numpy as np
+from alphafold3.data import custom_utils
 
+from absl import logging
 
 def validate_fold_input(fold_input: folding_input.Input):
   """Validates the fold input contains MSA and templates for featurisation."""
@@ -42,6 +45,7 @@ def featurise_input(
     ref_max_modified_date: datetime.date | None = None,
     conformer_max_iterations: int | None = None,
     verbose: bool = False,
+    masking_config: Optional[Dict[str, Any]] = None,
 ) -> Sequence[features.BatchDict]:
   """Featurise the folding input.
 
@@ -61,6 +65,9 @@ def featurise_input(
     conformer_max_iterations: Optional override for maximum number of iterations
       to run for RDKit conformer search.
     verbose: Whether to print progress messages.
+    masking_config: Optional dictionary with masking parameters like
+                    'positions_str', 'mask_msa', 'mask_deletion_matrix', 'mask_token'.
+                    If provided, masking will be applied to the features.
 
   Returns:
     A featurised batch for each rng_seed in the input.
@@ -81,12 +88,36 @@ def featurise_input(
     featurisation_start_time = time.time()
     if verbose:
       print(f'Featurising data with seed {rng_seed}.')
+    
+    # Process the item through the regular pipeline
     batch = data_pipeline.process_item(
         fold_input=fold_input,
         ccd=ccd,
         random_state=np.random.RandomState(rng_seed),
         random_seed=rng_seed,
     )
+    
+    # Apply masking to the features if configured
+    if masking_config and (masking_config.get('mask_msa') or masking_config.get('mask_deletion_matrix')) and masking_config.get('positions_str'):
+      if verbose:
+        print(f'Applying masking to features with seed {rng_seed}.')
+      masking_start_time = time.time()
+      
+      try:
+        # Apply masking to the feature dictionary
+        batch = custom_utils.apply_masking_to_features(batch, masking_config)
+        # Log the contents of the batch with logging.info
+        #logging.info(f"Batch contents: {batch}")
+        if verbose:
+          print(f'Applied masking in {time.time() - masking_start_time:.2f} seconds.')
+      except Exception as e:
+        logging.error(f"Error applying masking to features: {e}", exc_info=True)
+        if verbose:
+          print(f'Error applying masking: {e}')
+        # Decide whether to raise the error or continue without masking
+        # Here we continue without masking rather than failing the entire job
+        logging.warning("Continuing without masking due to error.")
+        
     if verbose:
       print(
           f'Featurising data with seed {rng_seed} took'

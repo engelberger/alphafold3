@@ -32,10 +32,11 @@ import string
 import textwrap
 import time
 import typing
-from typing import overload
+from typing import overload, Optional, Dict, Any
 
 from absl import app
 from absl import flags
+from absl import logging
 from alphafold3.common import folding_input
 from alphafold3.common import resources
 from alphafold3.constants import chemical_components
@@ -52,7 +53,8 @@ import haiku as hk
 import jax
 from jax import numpy as jnp
 import numpy as np
-
+from alphafold3.data.custom_utils import parse_mutation_string, apply_mutations_to_input, parse_masking_positions, apply_masking_to_features
+from alphafold3.model import data_constants
 
 _HOME_DIR = pathlib.Path(os.environ.get('HOME'))
 _DEFAULT_MODEL_DIR = _HOME_DIR / 'models'
@@ -282,6 +284,34 @@ _FORCE_OUTPUT_DIR = flags.DEFINE_bool(
     ' the inference separately, but use the same output directory.',
 )
 
+# --- Mutation and Masking Flags ---
+flags.DEFINE_string('mutations', None,
+                    'Comma-separated list of mutations, e.g., "A123G,R45C" or '
+                    '"A:G10C,B:R20D". Assumes 1-based indexing.')
+flags.DEFINE_string('mask_positions', None,
+                    'Comma-separated list and/or ranges of residue positions to '
+                    'mask in MSA/deletion matrix, e.g., "10-15,20,30". '
+                    'Assumes 1-based indexing.')
+flags.DEFINE_boolean('mask_msa', False,
+                     'Enable masking of specified positions in the MSA feature.')
+flags.DEFINE_boolean('mask_deletion_matrix', False,
+                     'Enable masking (zeroing) of specified positions in the '
+                     'deletion matrix.')
+
+# Attempt to get the list for validation, provide a fallback
+try:
+    # Ensure data_constants is imported and has this attribute
+    _VALID_MASK_TOKENS = data_constants.protein_restypes_with_unk_and_gap
+except (AttributeError, NameError):
+     logging.warning("Could not load valid mask tokens from data_constants. Using default list.")
+     _VALID_MASK_TOKENS = list('ACDEFGHIKLMNPQRSTVWYX-')
+
+flags.DEFINE_enum('mask_token', 'X', _VALID_MASK_TOKENS,
+                  'Amino acid character to use for masking MSA positions.')
+# ----------------------------------
+
+FLAGS = flags.FLAGS # Define FLAGS after all flags are defined
+
 
 def make_model_config(
     *,
@@ -402,6 +432,7 @@ def predict_structure(
     buckets: Sequence[int] | None = None,
     ref_max_modified_date: datetime.date | None = None,
     conformer_max_iterations: int | None = None,
+    masking_config: Optional[Dict[str, Any]] = None,
 ) -> Sequence[ResultsForSeed]:
   """Runs the full inference pipeline to predict structures for each seed."""
 
@@ -415,6 +446,7 @@ def predict_structure(
       verbose=True,
       ref_max_modified_date=ref_max_modified_date,
       conformer_max_iterations=conformer_max_iterations,
+      masking_config=masking_config,
   )
   print(
       f'Featurising data with {len(fold_input.rng_seeds)} seed(s) took'
@@ -555,6 +587,8 @@ def process_fold_input(
     data_pipeline_config: pipeline.DataPipelineConfig | None,
     model_runner: None,
     output_dir: os.PathLike[str] | str,
+    mutations_str: Optional[str],
+    masking_config: Dict[str, Any],
     buckets: Sequence[int] | None = None,
     ref_max_modified_date: datetime.date | None = None,
     conformer_max_iterations: int | None = None,
@@ -569,6 +603,8 @@ def process_fold_input(
     data_pipeline_config: pipeline.DataPipelineConfig | None,
     model_runner: ModelRunner,
     output_dir: os.PathLike[str] | str,
+    mutations_str: Optional[str],
+    masking_config: Dict[str, Any],
     buckets: Sequence[int] | None = None,
     ref_max_modified_date: datetime.date | None = None,
     conformer_max_iterations: int | None = None,
@@ -582,6 +618,8 @@ def process_fold_input(
     data_pipeline_config: pipeline.DataPipelineConfig | None,
     model_runner: ModelRunner | None,
     output_dir: os.PathLike[str] | str,
+    mutations_str: Optional[str],
+    masking_config: Dict[str, Any],
     buckets: Sequence[int] | None = None,
     ref_max_modified_date: datetime.date | None = None,
     conformer_max_iterations: int | None = None,
@@ -595,6 +633,8 @@ def process_fold_input(
       pipeline.
     model_runner: Model runner to use. If None, skip inference.
     output_dir: Output directory to write to.
+    mutations_str: Optional string defining mutations to apply.
+    masking_config: Dictionary with masking parameters.
     buckets: Bucket sizes to pad the data to, to avoid excessive re-compilation
       of the model. If None, calculate the appropriate bucket size from the
       number of tokens. If not None, must be a sequence of at least one integer,
@@ -619,6 +659,7 @@ def process_fold_input(
     ValueError: If the fold input has no chains.
   """
   print(f'\nRunning fold job {fold_input.name}...')
+  logging.info(f"Processing input: {fold_input.name}")
 
   if not fold_input.chains:
     raise ValueError('Fold input has no chains.')
@@ -635,33 +676,51 @@ def process_fold_input(
         f'Output will be written in {new_output_dir} since {output_dir} is'
         ' non-empty.'
     )
+    logging.warning(f"Output directory '{output_dir}' is non-empty. Using '{new_output_dir}' instead.")
     output_dir = new_output_dir
   else:
     print(f'Output will be written in {output_dir}')
 
   if data_pipeline_config is None:
     print('Skipping data pipeline...')
+    logging.info("Skipping data pipeline as config is None.")
   else:
     print('Running data pipeline...')
-    fold_input = pipeline.DataPipeline(data_pipeline_config).process(fold_input)
+    logging.info("Running data pipeline...")
+    try:
+        data_pipeline_runner = pipeline.DataPipeline(
+            data_pipeline_config=data_pipeline_config,
+            mutations_str=mutations_str,
+            masking_config=masking_config
+        )
+        fold_input = data_pipeline_runner.process(fold_input)
+        logging.info("Data pipeline finished successfully.")
+    except Exception as e:
+        logging.error(f"Data pipeline failed for job {fold_input.name}: {e}", exc_info=True)
+        raise
 
   write_fold_input_json(fold_input, output_dir)
+
   if model_runner is None:
     print('Skipping model inference...')
+    logging.info("Skipping model inference as model_runner is None.")
     output = fold_input
   else:
     print(
         f'Predicting 3D structure for {fold_input.name} with'
         f' {len(fold_input.rng_seeds)} seed(s)...'
     )
+    logging.info(f"Starting structure prediction for {fold_input.name} with {len(fold_input.rng_seeds)} seeds.")
     all_inference_results = predict_structure(
         fold_input=fold_input,
         model_runner=model_runner,
         buckets=buckets,
         ref_max_modified_date=ref_max_modified_date,
         conformer_max_iterations=conformer_max_iterations,
+        masking_config=masking_config,
     )
     print(f'Writing outputs with {len(fold_input.rng_seeds)} seed(s)...')
+    logging.info(f"Writing outputs for {fold_input.name}.")
     write_outputs(
         all_inference_results=all_inference_results,
         output_dir=output_dir,
@@ -670,66 +729,83 @@ def process_fold_input(
     output = all_inference_results
 
   print(f'Fold job {fold_input.name} done, output written to {output_dir}\n')
+  logging.info(f"Fold job {fold_input.name} finished. Output at: {output_dir}")
   return output
 
 
 def main(_):
+  # --- Setup JAX Cache ---
   if _JAX_COMPILATION_CACHE_DIR.value is not None:
+    logging.info(f"Setting JAX cache directory: {_JAX_COMPILATION_CACHE_DIR.value}")
     jax.config.update(
         'jax_compilation_cache_dir', _JAX_COMPILATION_CACHE_DIR.value
     )
+  # -----------------------
 
+  # --- Input Path Validation ---
   if _JSON_PATH.value is None == _INPUT_DIR.value is None:
-    raise ValueError(
+    raise app.UsageError(
         'Exactly one of --json_path or --input_dir must be specified.'
     )
+  # ---------------------------
 
+  # --- Stage Run Validation ---
   if not _RUN_INFERENCE.value and not _RUN_DATA_PIPELINE.value:
-    raise ValueError(
+    raise app.UsageError(
         'At least one of --run_inference or --run_data_pipeline must be'
         ' set to true.'
     )
+  # --------------------------
 
+  # --- Load Inputs ---
   if _INPUT_DIR.value is not None:
+    logging.info(f"Loading inputs from directory: {_INPUT_DIR.value}")
     fold_inputs = folding_input.load_fold_inputs_from_dir(
         pathlib.Path(_INPUT_DIR.value)
     )
   elif _JSON_PATH.value is not None:
+    logging.info(f"Loading input from file: {_JSON_PATH.value}")
     fold_inputs = folding_input.load_fold_inputs_from_path(
         pathlib.Path(_JSON_PATH.value)
     )
   else:
-    raise AssertionError(
-        'Exactly one of --json_path or --input_dir must be specified.'
-    )
+    # This case should be caught by the earlier validation
+    raise AssertionError('Input path logic error.')
+  logging.info(f"Loaded {fold_inputs} fold input(s).")
+  # -----------------
 
-  # Make sure we can create the output directory before running anything.
+  # --- Create Output Directory ---
   try:
     os.makedirs(_OUTPUT_DIR.value, exist_ok=True)
+    logging.info(f"Ensured output directory exists: {_OUTPUT_DIR.value}")
   except OSError as e:
-    print(f'Failed to create output directory {_OUTPUT_DIR.value}: {e}')
+    logging.error(f'Failed to create output directory {_OUTPUT_DIR.value}: {e}')
     raise
+  # -----------------------------
 
+  # --- GPU/Device Validation (only if running inference) ---
   if _RUN_INFERENCE.value:
-    # Fail early on incompatible devices, but only if we're running inference.
+    logging.info("Checking GPU compatibility for inference...")
     gpu_devices = jax.local_devices(backend='gpu')
     if gpu_devices:
-      compute_capability = float(
-          gpu_devices[_GPU_DEVICE.value].compute_capability
-      )
+      target_device = gpu_devices[_GPU_DEVICE.value]
+      logging.info(f"Using GPU device {_GPU_DEVICE.value}: {target_device}")
+      compute_capability = float(target_device.compute_capability)
+      logging.info(f"GPU Compute Capability: {compute_capability}")
+
       if compute_capability < 6.0:
         raise ValueError(
             'AlphaFold 3 requires at least GPU compute capability 6.0 (see'
             ' https://developer.nvidia.com/cuda-gpus).'
         )
       elif 7.0 <= compute_capability < 8.0:
-        xla_flags = os.environ.get('XLA_FLAGS')
+        xla_flags = os.environ.get('XLA_FLAGS', '')
         required_flag = '--xla_disable_hlo_passes=custom-kernel-fusion-rewriter'
-        if not xla_flags or required_flag not in xla_flags:
+        if required_flag not in xla_flags:
           raise ValueError(
               'For devices with GPU compute capability 7.x (see'
               ' https://developer.nvidia.com/cuda-gpus) the ENV XLA_FLAGS must'
-              f' include "{required_flag}".'
+              f' include "{required_flag}". Current XLA_FLAGS: "{xla_flags}"'
           )
         if _FLASH_ATTENTION_IMPLEMENTATION.value != 'xla':
           raise ValueError(
@@ -737,7 +813,16 @@ def main(_):
               ' https://developer.nvidia.com/cuda-gpus) the'
               ' --flash_attention_implementation must be set to "xla".'
           )
+      # Add checks for Triton/cuDNN compatibility if needed (e.g., Ampere+)
+      elif compute_capability < 8.0 and _FLASH_ATTENTION_IMPLEMENTATION.value != 'xla':
+          logging.warning(f"Flash attention implementation '{_FLASH_ATTENTION_IMPLEMENTATION.value}' "
+                          f"may not be optimal or compatible with compute capability {compute_capability}. "
+                          "Consider using 'xla' or upgrading hardware.")
+    else:
+         logging.warning("No GPU devices found by JAX. Inference will run on CPU, which is extremely slow.")
+  # ------------------------------------------------------
 
+  # --- Print Notice ---
   notice = textwrap.wrap(
       'Running AlphaFold 3. Please note that standard AlphaFold 3 model'
       ' parameters are only available under terms of use provided at'
@@ -750,42 +835,58 @@ def main(_):
       width=80,
   )
   print('\n' + '\n'.join(notice) + '\n')
+  # ------------------
 
+  # --- Prepare Data Pipeline Config ---
   max_template_date = datetime.date.fromisoformat(_MAX_TEMPLATE_DATE.value)
   if _RUN_DATA_PIPELINE.value:
+    logging.info("Preparing data pipeline configuration...")
     expand_path = lambda x: replace_db_dir(x, DB_DIR.value)
-    data_pipeline_config = pipeline.DataPipelineConfig(
-        jackhmmer_binary_path=_JACKHMMER_BINARY_PATH.value,
-        nhmmer_binary_path=_NHMMER_BINARY_PATH.value,
-        hmmalign_binary_path=_HMMALIGN_BINARY_PATH.value,
-        hmmsearch_binary_path=_HMMSEARCH_BINARY_PATH.value,
-        hmmbuild_binary_path=_HMMBUILD_BINARY_PATH.value,
-        small_bfd_database_path=expand_path(_SMALL_BFD_DATABASE_PATH.value),
-        mgnify_database_path=expand_path(_MGNIFY_DATABASE_PATH.value),
-        uniprot_cluster_annot_database_path=expand_path(
-            _UNIPROT_CLUSTER_ANNOT_DATABASE_PATH.value
-        ),
-        uniref90_database_path=expand_path(_UNIREF90_DATABASE_PATH.value),
-        ntrna_database_path=expand_path(_NTRNA_DATABASE_PATH.value),
-        rfam_database_path=expand_path(_RFAM_DATABASE_PATH.value),
-        rna_central_database_path=expand_path(_RNA_CENTRAL_DATABASE_PATH.value),
-        pdb_database_path=expand_path(_PDB_DATABASE_PATH.value),
-        seqres_database_path=expand_path(_SEQRES_DATABASE_PATH.value),
-        jackhmmer_n_cpu=_JACKHMMER_N_CPU.value,
-        nhmmer_n_cpu=_NHMMER_N_CPU.value,
-        max_template_date=max_template_date,
-    )
+    try:
+        data_pipeline_config = pipeline.DataPipelineConfig(
+            jackhmmer_binary_path=_JACKHMMER_BINARY_PATH.value,
+            nhmmer_binary_path=_NHMMER_BINARY_PATH.value,
+            hmmalign_binary_path=_HMMALIGN_BINARY_PATH.value,
+            hmmsearch_binary_path=_HMMSEARCH_BINARY_PATH.value,
+            hmmbuild_binary_path=_HMMBUILD_BINARY_PATH.value,
+            small_bfd_database_path=expand_path(_SMALL_BFD_DATABASE_PATH.value),
+            mgnify_database_path=expand_path(_MGNIFY_DATABASE_PATH.value),
+            uniprot_cluster_annot_database_path=expand_path(
+                _UNIPROT_CLUSTER_ANNOT_DATABASE_PATH.value
+            ),
+            uniref90_database_path=expand_path(_UNIREF90_DATABASE_PATH.value),
+            ntrna_database_path=expand_path(_NTRNA_DATABASE_PATH.value),
+            rfam_database_path=expand_path(_RFAM_DATABASE_PATH.value),
+            rna_central_database_path=expand_path(_RNA_CENTRAL_DATABASE_PATH.value),
+            pdb_database_path=expand_path(_PDB_DATABASE_PATH.value),
+            seqres_database_path=expand_path(_SEQRES_DATABASE_PATH.value),
+            jackhmmer_n_cpu=_JACKHMMER_N_CPU.value,
+            nhmmer_n_cpu=_NHMMER_N_CPU.value,
+            max_template_date=max_template_date,
+        )
+        logging.info("Data pipeline configuration prepared successfully.")
+    except Exception as e:
+        logging.error(f"Failed to prepare data pipeline config: {e}", exc_info=True)
+        raise
   else:
     data_pipeline_config = None
+    logging.info("Data pipeline execution is disabled.")
+  # ----------------------------------
 
+  # --- Prepare Model Runner ---
   if _RUN_INFERENCE.value:
+    logging.info("Preparing model runner...")
     devices = jax.local_devices(backend='gpu')
-    print(
-        f'Found local devices: {devices}, using device {_GPU_DEVICE.value}:'
-        f' {devices[_GPU_DEVICE.value]}'
-    )
+    if not devices: # Fallback to CPU if no GPU found/specified
+        logging.warning("No GPU found, using CPU for inference (will be slow).")
+        devices = jax.local_devices(backend='cpu')
+        if not devices:
+            raise RuntimeError("No JAX devices (GPU or CPU) available for inference.")
 
-    print('Building model from scratch...')
+    target_device_for_runner = devices[_GPU_DEVICE.value % len(devices)] # Use modulo for safety
+    logging.info(f"Using device {target_device_for_runner} for model runner.")
+
+    print('Building model from scratch...') # Keep user informed
     model_runner = ModelRunner(
         config=make_model_config(
             flash_attention_implementation=typing.cast(
@@ -795,33 +896,66 @@ def main(_):
             num_recycles=_NUM_RECYCLES.value,
             return_embeddings=_SAVE_EMBEDDINGS.value,
         ),
-        device=devices[_GPU_DEVICE.value],
+        device=target_device_for_runner,
         model_dir=pathlib.Path(MODEL_DIR.value),
     )
     # Check we can load the model parameters before launching anything.
-    print('Checking that model parameters can be loaded...')
-    _ = model_runner.model_params
+    print('Checking that model parameters can be loaded...') # Keep user informed
+    try:
+        _ = model_runner.model_params
+        logging.info("Model parameters loaded successfully.")
+    except Exception as e:
+        logging.error(f"Failed to load model parameters from {MODEL_DIR.value}: {e}", exc_info=True)
+        raise
   else:
     model_runner = None
+    logging.info("Model inference is disabled.")
+  # --------------------------
 
-  num_fold_inputs = 0
-  for fold_input in fold_inputs:
+  # --- Prepare Masking Config ---
+  # This is prepared once and passed to each job
+  masking_config = {
+      'positions_str': FLAGS.mask_positions,
+      'mask_msa': FLAGS.mask_msa,
+      'mask_deletion_matrix': FLAGS.mask_deletion_matrix,
+      'mask_token': FLAGS.mask_token
+  }
+  logging.info(f"Masking configuration prepared: {masking_config}")
+  # ----------------------------
+
+  # --- Process Each Input ---
+  num_fold_inputs_processed = 0
+  total_start_time = time.time()
+  for fold_input_item in fold_inputs:
+    job_start_time = time.time()
     if _NUM_SEEDS.value is not None:
-      print(f'Expanding fold job {fold_input.name} to {_NUM_SEEDS.value} seeds')
-      fold_input = fold_input.with_multiple_seeds(_NUM_SEEDS.value)
+      logging.info(f'Expanding fold job {fold_input_item.name} to {_NUM_SEEDS.value} seeds')
+      fold_input_item = fold_input_item.with_multiple_seeds(_NUM_SEEDS.value)
+
+    # Define output directory for this specific job
+    job_output_dir = os.path.join(_OUTPUT_DIR.value, fold_input_item.sanitised_name())
+
     process_fold_input(
-        fold_input=fold_input,
+        fold_input=fold_input_item,
         data_pipeline_config=data_pipeline_config,
         model_runner=model_runner,
-        output_dir=os.path.join(_OUTPUT_DIR.value, fold_input.sanitised_name()),
+        output_dir=job_output_dir,
+        # --- Pass mutation/masking args ---
+        mutations_str=FLAGS.mutations,
+        masking_config=masking_config,
+        # ----------------------------------
         buckets=tuple(int(bucket) for bucket in _BUCKETS.value),
         ref_max_modified_date=max_template_date,
         conformer_max_iterations=_CONFORMER_MAX_ITERATIONS.value,
         force_output_dir=_FORCE_OUTPUT_DIR.value,
     )
-    num_fold_inputs += 1
+    num_fold_inputs_processed += 1
+    logging.info(f"Finished processing job {fold_input_item.name} in {time.time() - job_start_time:.2f} seconds.")
 
-  print(f'Done running {num_fold_inputs} fold jobs.')
+  total_time = time.time() - total_start_time
+  print(f'\nDone running {num_fold_inputs_processed} fold job(s) in {total_time:.2f} seconds.')
+  logging.info(f"Finished processing all {num_fold_inputs_processed} jobs in {total_time:.2f} seconds.")
+  # ------------------------
 
 
 if __name__ == '__main__':

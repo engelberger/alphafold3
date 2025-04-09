@@ -1,0 +1,19 @@
+input_examples/*
+# ignore all pycache files
+__pycache__/*
+*.pyc
+*.pyo
+*.pyd
+*.pyw
+*.pyz
+D*.md
+output/*
+*.sh
+.vscode/launch.json
+out*
+src/alphafold3/constants/converters/ccd.pickle
+src/alphafold3/constants/converters/chemical_component_sets.pickle
+.devcontainer/docker-compose.yml
+.devcontainer/devcontainer.json
+.devcontainer/README.md
+docker/dev/Dockerfile.dev

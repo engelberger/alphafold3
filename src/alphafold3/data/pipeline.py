@@ -16,6 +16,9 @@ import datetime
 import functools
 import logging
 import time
+from typing import Optional, Dict, Any
+
+import numpy as np
 
 from alphafold3.common import folding_input
 from alphafold3.constants import mmcif_names
@@ -24,6 +27,15 @@ from alphafold3.data import msa_config
 from alphafold3.data import structure_stores
 from alphafold3.data import templates as templates_lib
 
+# --- Add import for custom utilities ---
+try:
+    # Assuming custom_utils.py is in the same directory (data)
+    from . import custom_utils
+except ImportError:
+    # Handle case where custom_utils might be elsewhere or naming is different
+    logging.error("Could not import custom_utils. Ensure src/alphafold3/data/custom_utils.py exists.")
+    raise
+# -------------------------------------
 
 # Cache to avoid re-running template search for the same sequence in homomers.
 @functools.cache
@@ -262,8 +274,20 @@ class DataPipelineConfig:
 class DataPipeline:
   """Runs the alignment tools and assembles the input features."""
 
-  def __init__(self, data_pipeline_config: DataPipelineConfig):
-    """Initializes the data pipeline with default configurations."""
+  def __init__(
+      self,
+      data_pipeline_config: DataPipelineConfig,
+      mutations_str: Optional[str] = None,
+      masking_config: Optional[Dict[str, Any]] = None,
+  ):
+    """Initializes the data pipeline.
+
+    Args:
+        data_pipeline_config: The core configuration for database paths and tool settings.
+        mutations_str: Optional string defining mutations to apply.
+        masking_config: Optional dictionary with masking parameters.
+                       (Note: Masking is applied *after* this pipeline runs).
+    """
     self._uniref90_msa_config = msa_config.RunConfig(
         config=msa_config.JackhmmerConfig(
             binary_path=data_pipeline_config.jackhmmer_binary_path,
@@ -410,6 +434,19 @@ class DataPipeline:
     )
     self._pdb_database_path = data_pipeline_config.pdb_database_path
 
+    # --- Store new args ---
+    self._mutations_str = mutations_str
+    # Store masking_config, even though masking is applied later,
+    # in case it's needed for future logic here.
+    self._masking_config = masking_config if masking_config else {}
+    # --------------------
+
+    logging.info(f"DataPipeline initialized.")
+    if self._mutations_str:
+        logging.info(f" Mutations to be applied: {self._mutations_str}")
+    if self._masking_config and self._masking_config.get('positions_str'):
+        logging.info(f" Masking config received: {self._masking_config}")
+
   def process_protein_chain(
       self, chain: folding_input.ProteinChain
   ) -> folding_input.ProteinChain:
@@ -529,11 +566,40 @@ class DataPipeline:
         unpaired_msa=unpaired_msa,
     )
 
-  def process(self, fold_input: folding_input.Input) -> folding_input.Input:
-    """Runs MSA and template tools and returns a new Input with the results."""
+  def process(self, input_obj: folding_input.Input) -> folding_input.Input:
+    """Runs MSA and template tools and returns a new Input with the results.
+
+    Applies mutations to the input object *before* running MSA/template tools.
+    Masking is applied *after* this pipeline and featurization are complete.
+
+    Args:
+        input_obj: A FoldingInput object.
+
+    Returns:
+        A FoldingInput object, potentially modified with mutations, and with
+        MSA/template information added.
+    """
+    logging.info(f"Starting data pipeline processing for input: {input_obj.name}")
+
+    # --- Apply Mutations (Early Step) ---
+    # Modify the input object *before* processing individual chains
+    if self._mutations_str:
+        try:
+            logging.info(f"Attempting to apply mutations: {self._mutations_str}")
+            parsed_mutations = custom_utils.parse_mutation_string(self._mutations_str)
+            # Modify input_obj in place or get the modified object back
+            input_obj = custom_utils.apply_mutations_to_input(input_obj, parsed_mutations)
+            logging.info("Mutations applied to input object sequences.")
+        except Exception as e:
+            logging.error(f"Failed to apply mutations: {e}", exc_info=True)
+            # Decide whether to raise the error or continue without mutations
+            raise # Reraise the error to halt execution
+    # ------------------------------------
+
+    # --- Process Chains (Using potentially mutated sequences) ---
     processed_chains = []
-    for chain in fold_input.chains:
-      print(f'Running data pipeline for chain {chain.id}...')
+    for chain in input_obj.chains:
+      logging.info(f'Running data pipeline for chain {chain.id}...')
       process_chain_start_time = time.time()
       match chain:
         case folding_input.ProteinChain():
@@ -541,10 +607,17 @@ class DataPipeline:
         case folding_input.RnaChain():
           processed_chains.append(self.process_rna_chain(chain))
         case _:
+          # Keep other chain types (DNA, Ligand) as they are
           processed_chains.append(chain)
-      print(
+      logging.info(
           f'Running data pipeline for chain {chain.id} took'
           f' {time.time() - process_chain_start_time:.2f} seconds',
       )
+    # ---------------------------------------------------------
 
-    return dataclasses.replace(fold_input, chains=processed_chains)
+    # --- Return updated Input object ---
+    # Replace the chains in the original input object with the processed ones
+    final_input_obj = dataclasses.replace(input_obj, chains=processed_chains)
+    logging.info(f"Data pipeline processing finished for input: {input_obj.name}")
+    return final_input_obj
+  # ---------------------------------
