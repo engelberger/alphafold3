@@ -145,15 +145,15 @@ class BinderDesigner:
             result = model_runner_obj.run_inference(updated_feature_dict, rng_key)
             
             # --- Debugging: Log shapes --- 
-            try:
-                plddt_shape = result.get('predicted_lddt', 'Key not found').shape if 'predicted_lddt' in result else 'Key not found'
-                binder_indices_shape = binder_indices.shape
-                logging.info(f"[Debug] predicted_lddt shape: {plddt_shape}")
-                logging.info(f"[Debug] binder_indices shape: {binder_indices_shape}")
-                logging.info(f"[Debug] binder_indices[:5]: {binder_indices[:5]}")
-                logging.info(f"[Debug] binder_indices[-5:]: {binder_indices[-5:]}")
-            except Exception as e:
-                logging.error(f"[Debug] Error logging shapes: {e}")
+            #try:
+            #    plddt_shape = result.get('predicted_lddt', 'Key not found').shape if 'predicted_lddt' in result else 'Key not found'
+            #    binder_indices_shape = binder_indices.shape
+            #    logging.info(f"[Debug] predicted_lddt shape: {plddt_shape}")
+            #    logging.info(f"[Debug] binder_indices shape: {binder_indices_shape}")
+            #    logging.info(f"[Debug] binder_indices[:5]: {binder_indices[:5]}")
+            #    logging.info(f"[Debug] binder_indices[-5:]: {binder_indices[-5:]}")
+            #except Exception as e:
+            #    logging.error(f"[Debug] Error logging shapes: {e}")
             # --- End Debugging ---
             
             # Calculate loss

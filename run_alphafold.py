@@ -782,7 +782,7 @@ def process_fold_input(
       ccd = chemical_components.cached_ccd(user_ccd=fold_input.user_ccd)
       
       # Featurize the input (same as for prediction)
-      # Note: We only need the first seed's features for design.
+      # This will create features for *each* seed specified in the input
       featurisation_start_time = time.time()
       featurised_examples = featurisation.featurise_input(
           fold_input=fold_input,
@@ -798,118 +798,180 @@ def process_fold_input(
           f' {time.time() - featurisation_start_time:.2f} seconds.'
       )
       
-      # Get the first featurized example (we only need one for design)
-      initial_feature_dict = featurised_examples[0]
-      design_seed = fold_input.rng_seeds[0]
+      # Initialize list to store results for each seed
+      all_inference_results = []
       
-      # Run the design
-      design_start_time = time.time()
-      design_results, final_model_result, final_feature_dict, new_fold_input = binder_design.design_binder(
-          fold_input=fold_input, # Pass original fold input
-          feature_dict=initial_feature_dict,
-          model_runner=model_runner,
-          ccd=ccd,
-          design_params=design_params,
-          rng_seed=design_seed,
-          buckets=buckets,
-          ref_max_modified_date=ref_max_modified_date,
-          conformer_max_iterations=conformer_max_iterations,
-          use_complete_prediction=True  # Use complete prediction pipeline for final structure
-      )
-      print(f'Binder design and final prediction took {time.time() - design_start_time:.2f} seconds.')
+      # --- Loop over seeds for design ---
+      for design_seed, initial_feature_dict in zip(fold_input.rng_seeds, featurised_examples):
+        print(f'--- Starting design process for seed {design_seed} ---')
+        logging.info(f"Running binder design for seed {design_seed}")
       
-      # Extract results using the FINAL feature dict and model result
-      inference_results, embeddings = model_runner.extract_inference_results_and_maybe_embeddings(
-          batch=final_feature_dict, # Use the final features corresponding to the designed sequence
-          result=final_model_result, # Use the result from the final prediction run
-          target_name=new_fold_input.name # Use the name from the new input
-      )
-      
-      # Create ResultsForSeed with the final prediction using the NEW fold input
-      # This ensures the output writer uses the designed sequence
-      all_inference_results = [
-          ResultsForSeed(
-              seed=design_seed,
-              inference_results=inference_results,
-              full_fold_input=new_fold_input, # CRITICAL: Use the new fold input with the designed sequence
-              embeddings=embeddings if _SAVE_EMBEDDINGS.value else None
-          )
-      ]
-      
-      # Write design-specific outputs (like trajectory)
-      print(f'Writing design-specific outputs...')
-      os.makedirs(output_dir, exist_ok=True)
-      
-      # Save the design results (trajectory, losses etc.) as JSON
-      import json
-      design_output_path = os.path.join(output_dir, f'{new_fold_input.sanitised_name()}_design_results.json')
-      with open(design_output_path, 'w') as f:
-          # Convert arrays to lists for JSON serialization
-          json_safe_results = {}
-          for k, v in design_results.items():
-              if k == 'trajectory':
-                  # Special handling for trajectory to make it JSON-serializable
-                  json_safe_trajectory = {}
-                  for tk, tv in v.items():
-                      if tk == 'losses' or tk == 'sequences':
-                          json_safe_trajectory[tk] = tv
-                      elif isinstance(tv, (np.ndarray, jnp.ndarray)):
-                          json_safe_trajectory[tk] = tv.tolist() # Convert arrays
-                      else:
-                          json_safe_trajectory[tk] = tv
-                  json_safe_results[k] = json_safe_trajectory
-              elif isinstance(v, (np.ndarray, jnp.ndarray)):
-                   # Convert other arrays if needed, skip large ones
-                  if k not in ['best_feature_dict', 'final_seq_logits']: # Example of skipping large/unserializable items
-                    try:
-                        json_safe_results[k] = v.tolist()
-                    except AttributeError: # Handle non-array types that might sneak in
-                        json_safe_results[k] = v
-              elif k not in ['best_feature_dict', 'final_seq_logits']:
-                  # Keep other items as they are (protocol, best_loss, etc.)
-                  json_safe_results[k] = v
-          
-          # Add the final designed sequence explicitly for easy access
-          designed_sequence = new_fold_input.chains[design_params.get('binder_chain_index', 1)].sequence # Assuming binder is second chain
-          json_safe_results['final_designed_sequence'] = designed_sequence
+        # Run the design for the current seed
+        design_start_time = time.time()
+        design_results, final_model_result, final_feature_dict, new_fold_input = binder_design.design_binder(
+            fold_input=fold_input, # Pass original fold input (sequence is replaced inside)
+            feature_dict=initial_feature_dict, # Use features for this specific seed
+            model_runner=model_runner,
+            ccd=ccd,
+            design_params=design_params,
+            rng_seed=design_seed, # Pass the current seed
+            buckets=buckets,
+            ref_max_modified_date=ref_max_modified_date,
+            conformer_max_iterations=conformer_max_iterations,
+            use_complete_prediction=True  # Use complete prediction pipeline for final structure
+        )
+        current_design_time = time.time() - design_start_time
+        print(f'Binder design and final prediction for seed {design_seed} took {current_design_time:.2f} seconds.')
+        logging.info(f"Design for seed {design_seed} finished in {current_design_time:.2f} seconds.")
+        
+        # Extract results using the FINAL feature dict and model result for this seed
+        inference_results, embeddings = model_runner.extract_inference_results_and_maybe_embeddings(
+            batch=final_feature_dict, # Use the final features corresponding to the designed sequence
+            result=final_model_result, # Use the result from the final prediction run
+            target_name=new_fold_input.name # Use the name from the new input (might include _designed suffix)
+        )
+        
+        # Append ResultsForSeed for this seed's final prediction
+        all_inference_results.append(
+            ResultsForSeed(
+                seed=design_seed,
+                inference_results=inference_results,
+                full_fold_input=new_fold_input, # CRITICAL: Use the new fold input with the designed sequence for this seed
+                embeddings=embeddings if _SAVE_EMBEDDINGS.value else None
+            )
+        )
+        
+        # Write design-specific outputs (like trajectory) for this seed
+        print(f'Writing design-specific outputs for seed {design_seed}...')
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # Save the design results (trajectory, losses etc.) as JSON, specific to the seed
+        import json
+        # Use the potentially modified name from new_fold_input
+        sanitised_name = new_fold_input.sanitised_name() 
+        design_output_path = os.path.join(output_dir, f'{sanitised_name}_seed_{design_seed}_design_results.json')
+        with open(design_output_path, 'w') as f:
+            # Convert arrays to lists for JSON serialization
+            json_safe_results = {}
+            for k, v in design_results.items():
+                if k == 'trajectory':
+                    # Special handling for trajectory to make it JSON-serializable
+                    json_safe_trajectory = {}
+                    for tk, tv in v.items():
+                        if tk == 'losses' or tk == 'sequences': # Keep these as lists of dicts/strings
+                            json_safe_trajectory[tk] = tv
+                        elif isinstance(tv, (np.ndarray, jnp.ndarray)):
+                            json_safe_trajectory[tk] = tv.tolist() # Convert arrays
+                        else:
+                            json_safe_trajectory[tk] = tv
+                    json_safe_results[k] = json_safe_trajectory
+                elif isinstance(v, (np.ndarray, jnp.ndarray)):
+                     # Convert other arrays if needed, skip large ones
+                    if k not in ['best_feature_dict', 'final_seq_logits']: # Example of skipping large/unserializable items
+                      try:
+                          json_safe_results[k] = v.tolist()
+                      except AttributeError: # Handle non-array types that might sneak in
+                          json_safe_results[k] = v
+                elif k not in ['best_feature_dict', 'final_seq_logits']:
+                    # Keep other items as they are (protocol, best_loss, etc.)
+                    json_safe_results[k] = v
+            
+            # Add the final designed sequence explicitly for easy access
+            # Need to find binder chain index dynamically
+            binder_chain_id = design_params.get('binder_chains', [''])[0] # Assume first binder chain for now
+            binder_chain_index = -1
+            for idx, chain in enumerate(new_fold_input.chains):
+                if chain.id == binder_chain_id:
+                    binder_chain_index = idx
+                    break
+            
+            if binder_chain_index != -1:
+                designed_sequence = new_fold_input.chains[binder_chain_index].sequence
+                json_safe_results['final_designed_sequence'] = designed_sequence
+            else:
+                logging.warning(f"Could not find binder chain ID '{binder_chain_id}' in new_fold_input for seed {design_seed}")
 
-          json.dump(json_safe_results, f, indent=2, default=lambda x: '<not serializable>')
-      print(f'Saved design results summary to {design_output_path}')
+
+            json.dump(json_safe_results, f, indent=2, default=lambda x: '<not serializable>')
+        print(f'Saved design results summary for seed {design_seed} to {design_output_path}')
       
-      # Standard output writing (will now use the ResultsForSeed with the designed sequence)
-      print(f'Writing final predicted structure(s)...')
-      write_outputs(
-          all_inference_results=all_inference_results, # This now contains the designed result
-          output_dir=output_dir,
-          job_name=new_fold_input.sanitised_name(), # Use the name from the new input
-      )
+      # --- End loop over seeds ---
+
+      # Standard output writing (will now use the potentially multiple ResultsForSeed collected)
+      print(f'Writing final predicted structure(s) for all seeds...')
+      # The write_outputs function should handle the list `all_inference_results`
+      output = all_inference_results # Pass the list of results
       
-      output = all_inference_results # Return the results containing the designed structure
     else:
-      # Standard prediction workflow
-      print(
-          f'Predicting 3D structure for {fold_input.name} with'
-          f' {len(fold_input.rng_seeds)} seed(s)...'
-      )
-      logging.info(f"Starting structure prediction for {fold_input.name} with {len(fold_input.rng_seeds)} seeds.")
-      all_inference_results = predict_structure(
+      # --- Standard Prediction Logic ---
+      print('Running standard prediction protocol...')
+      logging.info("Running standard prediction...")
+      
+      # Get CCD
+      ccd = chemical_components.cached_ccd(user_ccd=fold_input.user_ccd)
+      
+      # Featurize the input
+      featurisation_start_time = time.time()
+      featurised_examples = featurisation.featurise_input(
           fold_input=fold_input,
-          model_runner=model_runner,
           buckets=buckets,
+          ccd=ccd,
+          verbose=True,
           ref_max_modified_date=ref_max_modified_date,
           conformer_max_iterations=conformer_max_iterations,
           masking_config=masking_config,
       )
-      print(f'Writing outputs with {len(fold_input.rng_seeds)} seed(s)...')
-      logging.info(f"Writing outputs for {fold_input.name}.")
-      write_outputs(
-          all_inference_results=all_inference_results,
-          output_dir=output_dir,
-          job_name=fold_input.sanitised_name(),
+      print(
+          f'Featurising data took {time.time() - featurisation_start_time:.2f}'
+          ' seconds.'
       )
-      output = all_inference_results
 
-  print(f'Fold job {fold_input.name} done, output written to {output_dir}\n')
+      all_inference_results = []
+      inference_start_time = time.time()
+      # --- Loop over seeds for prediction ---
+      for rng_seed, featurised_example in zip(
+          fold_input.rng_seeds, featurised_examples
+      ):
+        print(f'Running prediction with seed {rng_seed}...')
+        logging.info(f"Running prediction with seed {rng_seed}...")
+        rng_key = jax.random.PRNGKey(rng_seed)
+        model_result = model_runner.run_inference(featurised_example, rng_key)
+
+        inference_results, embeddings = (
+            model_runner.extract_inference_results_and_maybe_embeddings(
+                batch=featurised_example,
+                result=model_result,
+                target_name=fold_input.name,
+            )
+        )
+        all_inference_results.append(
+            ResultsForSeed(
+                seed=rng_seed,
+                inference_results=inference_results,
+                full_fold_input=fold_input,
+                embeddings=embeddings if _SAVE_EMBEDDINGS.value else None
+            )
+        )
+      # --- End loop over seeds ---
+      output = all_inference_results
+      print(
+          f'Model inference took'
+          f' {time.time() - inference_start_time:.2f} seconds.'
+      )
+
+  # Write outputs (either list of ResultsForSeed or the modified fold_input)
+  if isinstance(output, Sequence) and all(
+      isinstance(item, ResultsForSeed) for item in output
+  ):
+    write_outputs(output, output_dir, fold_input.name)
+  elif isinstance(output, folding_input.Input):
+    # This path is only taken if model_runner was None
+    pass
+  else:
+      logging.warning(f"Unexpected type for 'output' variable: {type(output)}. Skipping output writing.")
+
+
+  print(f'Fold job {fold_input.name} done, output written to {output_dir}')
   logging.info(f"Fold job {fold_input.name} finished. Output at: {output_dir}")
   return output
 
