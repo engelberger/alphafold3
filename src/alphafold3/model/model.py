@@ -257,7 +257,7 @@ class Model(hk.Module):
     return sample
 
   def __call__(
-      self, batch: features.BatchDict, key: jax.Array | None = None
+      self, batch: features.BatchDict, key: jax.Array | None = None, mode: str | None = None
   ) -> ModelResult:
     if key is None:
       key = hk.next_rng_key()
@@ -311,6 +311,13 @@ class Model(hk.Module):
         sample_config=self.config.heads.diffusion.eval,
     )
 
+    # For boltz_design mode, stop gradient at the structure positions
+    if mode == "boltz_design":
+      atom_positions = jax.lax.stop_gradient(samples['atom_positions'])
+      logging.info("BoltzDesign1 mode: Applied stop_gradient to atom_positions")
+    else:
+      atom_positions = samples['atom_positions']
+
     # Compute dist_error_fn over all samples for distance error logging.
     confidence_output = mapping.sharded_map(
         lambda dense_atom_positions: confidence_head.ConfidenceHead(
@@ -323,7 +330,7 @@ class Model(hk.Module):
             asym_id=batch.token_features.asym_id,
         ),
         in_axes=0,
-    )(samples['atom_positions'])
+    )(atom_positions)  # Use atom_positions which might have stop_gradient applied
 
     distogram = distogram_head.DistogramHead(
         self.config.heads.distogram, self.global_config

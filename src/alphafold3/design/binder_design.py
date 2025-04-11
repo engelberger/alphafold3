@@ -124,6 +124,14 @@ class BinderDesigner:
         optimizer = optax.adam(learning_rate=lr)
         opt_state = optimizer.init(binder_seq_logits)
         
+        # --- Filter out non-JAX compatible types from feature_dict_template --- 
+        # Identify keys holding object arrays (like Structure objects)
+        keys_to_remove = [k for k, v in feature_dict.items() if isinstance(v, np.ndarray) and v.dtype == object]
+        logging.info(f"Filtering object-dtype keys from feature_dict for JIT: {keys_to_remove}")
+        # Create a dictionary containing only JAX-compatible data
+        feature_dict_jax = {k: v for k, v in feature_dict.items() if k not in keys_to_remove}
+        # --------------------------------------------------------------------------
+        
         # Setup logging and trajectory storage
         trajectory = {
             "loss": [],
@@ -178,7 +186,7 @@ class BinderDesigner:
             
             # Compute gradients
             (loss, (losses, result, updated_feature_dict)), grads = grad_fn(
-                binder_seq_logits, feature_dict, target_indices, binder_indices, 
+                binder_seq_logits, feature_dict_jax, target_indices, binder_indices, 
                 self.design_params, self.model_runner, step_key
             )
             
@@ -253,22 +261,15 @@ class BinderDesigner:
         Returns:
             Partial results from the forward pass.
         """
-        # Import the proper implementation from model.py
-        from alphafold3.design.model import run_boltz_forward_pass
-        
-        # Access the model parameters and config from the model_runner
-        model_params = self.model_runner.model_params
-        model_config = self.model_runner._model_config
-        
-        # Run the proper boltz forward pass
-        boltz_result = run_boltz_forward_pass(
-            model_params=model_params,
-            config=model_config,
-            feature_dict=feature_dict,
-            rng_key=rng_key
+        # Run the standard model inference but with a special mode parameter
+        # that indicates this is a boltz design run (will stop_gradient at structure module)
+        boltz_result = self.model_runner.run_inference(
+            feature_dict, 
+            rng_key,
+            mode="boltz_design"  # Special mode to signal gradient stopping for BoltzDesign1
         )
         
-        logging.info("Ran BoltzDesign forward pass successfully")
+        logging.info("Ran BoltzDesign forward pass successfully using main model with 'boltz_design' mode")
         return boltz_result
     
     def _design_binder_boltz(
@@ -294,6 +295,14 @@ class BinderDesigner:
         logging.info("Starting BoltzDesign1-like binder design...")
         design_start_time = time.time()
         
+        # Keep original feature_dict as template
+        feature_dict_template = feature_dict
+        
+        # Convert NumPy arrays to tuples for static JIT arguments
+        target_indices_static_tuple = tuple(map(int, target_indices))
+        binder_indices_static_tuple = tuple(map(int, binder_indices))
+        logging.info("Converted target/binder indices to tuples for static JIT arguments.")
+        
         # Initialize sequence logits randomly
         num_residue_types = 20  # Standard amino acids
         binder_seq_logits = jnp.zeros((len(binder_indices), num_residue_types))
@@ -310,6 +319,23 @@ class BinderDesigner:
         optimizer = optax.adam(learning_rate=lr)
         opt_state = optimizer.init(binder_seq_logits)
         
+        # --- Filter out non-JAX compatible types from feature_dict_template --- 
+        # Identify keys holding object arrays (like Structure objects)
+        keys_to_remove = [k for k, v in feature_dict_template.items() if isinstance(v, np.ndarray) and v.dtype == object]
+        logging.info(f"Filtering object-dtype keys from feature_dict_template for JIT: {keys_to_remove}")
+        # Create a dictionary containing only JAX-compatible data
+        feature_dict_template_jax = {k: v for k, v in feature_dict_template.items() if k not in keys_to_remove}
+        # --------------------------------------------------------------------------
+        
+        # --- Extract numerical weights from design_params --- 
+        # Pass only this potentially hashable dictionary to the JITted function
+        design_weights_static = self.design_params.get('weights', {})
+        logging.info(f"Extracted static weights for JIT: {design_weights_static}")
+        # Dictionaries are generally not hashable for JIT, treat weights as non-static.
+        # stage_idx (1) must be static for control flow. Indices (5, 6) and runner (8) are also static.
+        static_argnums_for_jit = (1, 5, 6, 8) # stage_idx, Indices (tuples), Runner
+        # -----------------------------------------------------
+        
         # Setup logging and trajectory storage
         trajectory = {
             "loss": [],
@@ -321,10 +347,23 @@ class BinderDesigner:
         }
         
         # Define loss function for gradient calculation with the boltz approach
-        def loss_fn_for_grad_boltz(curr_binder_logits, feature_dict_template, target_indices, 
-                                  binder_indices, design_params_static, stage, temperature, rng_key):
+        def loss_fn_for_grad_boltz(
+            curr_binder_logits,     # Arg 0 (Non-static, Differentiate)
+            stage_idx,              # Arg 1 (Non-static, Varies)
+            temp,                   # Arg 2 (Non-static, Varies)
+            rng_key,                # Arg 3 (Non-static, Varies)
+            # --- Static arguments ---
+            feature_dict_template,  # Arg 4 (Static)
+            target_indices_tuple,   # Arg 5 (Static - NOW A TUPLE)
+            binder_indices_tuple,   # Arg 6 (Static - NOW A TUPLE)
+            design_params_static,   # Arg 7 (Static)
+            model_runner_obj        # Arg 8 (Static)
+        ):
+            # Convert tuples back to JAX arrays for use
+            target_indices = jnp.array(target_indices_tuple, dtype=jnp.int32)
+            binder_indices = jnp.array(binder_indices_tuple, dtype=jnp.int32)
+            
             # Stage-specific sequence representation
-            stage_idx = stage
             num_residue_types = curr_binder_logits.shape[-1]
             
             # Process sequence logits based on stage
@@ -332,16 +371,18 @@ class BinderDesigner:
                 temp = 1.0
                 seq_probs = jax.nn.softmax(curr_binder_logits / temp, axis=-1)
             elif stage_idx == 1:  # Stage 2: Transition
-                temp = temperature
+                # Use the temp parameter directly
                 # Interpolation between logits and softmax probabilities
                 seq_probs_logits = jax.nn.softmax(curr_binder_logits, axis=-1)
                 seq_probs_softmax = jax.nn.softmax(curr_binder_logits / temp, axis=-1)
                 seq_probs = 0.5 * seq_probs_logits + 0.5 * seq_probs_softmax
-            elif stage_idx == 2:  # Stage 3: Convergence (decreasing temperature)
-                temp = temperature
+            elif stage_idx == 2:  # Stage 3: Convergence (gradually decreasing temperature)
+                # Initial temp for this stage
+                temp = 0.5
+                logging.info(f"Starting stage 3: Convergence with initial temperature {temp}")
                 seq_probs = jax.nn.softmax(curr_binder_logits / temp, axis=-1)
             elif stage_idx == 3:  # Stage 4: One-hot with straight-through estimator
-                temp = temperature
+                # Use the temp parameter directly
                 # Softmax with very low temperature (approximates one-hot)
                 seq_probs_soft = jax.nn.softmax(curr_binder_logits / temp, axis=-1)
                 # Get hard one-hot
@@ -351,9 +392,11 @@ class BinderDesigner:
             else:
                 raise ValueError(f"Invalid stage index: {stage_idx}")
             
-            # Update features based on sequence probabilities
+            # Update features based on sequence probabilities - use JAX array binder_indices
             updated_feature_dict = binder_utils.update_features_from_logits(
-                feature_dict_template.copy(), binder_indices, curr_binder_logits
+                jax.tree_map(lambda x: x.copy() if isinstance(x, (jnp.ndarray, np.ndarray)) else x, feature_dict_template),
+                binder_indices,  # Use JAX array here
+                curr_binder_logits
             )
             
             # Run Boltz forward pass with gradient stopping at structure module
@@ -362,7 +405,7 @@ class BinderDesigner:
                 updated_feature_dict, step_key, stop_gradient=True
             )
             
-            # Calculate BoltzDesign1 loss
+            # Calculate BoltzDesign1 loss - use JAX arrays target_indices, binder_indices
             total_loss, loss_breakdown = binder_loss.calculate_boltz_binder_loss(
                 boltz_result, updated_feature_dict, target_indices, binder_indices, 
                 curr_binder_logits, design_params_static
@@ -378,9 +421,15 @@ class BinderDesigner:
             
             return total_loss, (loss_breakdown, boltz_result, updated_feature_dict)
         
-        grad_fn = jax.value_and_grad(loss_fn_for_grad_boltz, has_aux=True)
+        # Define the gradient function directly on the loss function
+        grad_loss_fn = jax.value_and_grad(loss_fn_for_grad_boltz, argnums=0, has_aux=True)
         
-        # Multi-stage optimization loop based on BoltzDesign1 paper
+        # JIT the gradient function, marking static arguments
+        # Arguments: 0=logits, 1=stage, 2=temp, 3=key, 4=features, 5=tgt idx tuple, 6=bnd idx tuple, 7=weights_dict, 8=runner
+        # Use the correctly defined static_argnums_for_jit
+        grad_fn = jax.jit(grad_loss_fn, static_argnums=static_argnums_for_jit)
+        
+        # Multi-stage optimization
         best_loss = float('inf')
         best_logits = None
         best_feature_dict = None
@@ -414,10 +463,20 @@ class BinderDesigner:
                     t_stage = (step + 1) / stage_steps
                     temp = 0.01 + (0.5 - 0.01) * (1.0 - t_stage)**2
                 
-                # Compute gradients
+                # Call the JITted grad_fn with all arguments explicitly
+                # Passing the tuples for static indices arguments and the filtered feature dict
                 (loss, (losses, partial_result, updated_feature_dict)), grads = grad_fn(
-                    binder_seq_logits, feature_dict, target_indices, binder_indices, 
-                    self.design_params, stage_idx, temp, step_key
+                    binder_seq_logits,          # Arg 0
+                    stage_idx,                  # Arg 1
+                    temp,                       # Arg 2
+                    step_key,                   # Arg 3
+                    # --- Pass the filtered dict as non-static --- 
+                    feature_dict_template_jax,  # Arg 4 
+                    # --- Static arguments --- 
+                    target_indices_static_tuple, # Arg 5 (Pass tuple)
+                    binder_indices_static_tuple, # Arg 6 (Pass tuple)
+                    design_weights_static,      # Arg 7 (Pass weights dict)
+                    self.model_runner           # Arg 8 (Static)
                 )
                 
                 # Update logits

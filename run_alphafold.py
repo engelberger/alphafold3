@@ -415,21 +415,32 @@ class ModelRunner:
   @functools.cached_property
   def _model(
       self,
-  ) -> Callable[[jnp.ndarray, features.BatchDict], model.ModelResult]:
+  ) -> Callable[[jnp.ndarray, features.BatchDict, str | None], model.ModelResult]:
     """Loads model parameters and returns a jitted model forward pass."""
 
     @hk.transform
-    def forward_fn(batch):
-      return model.Model(self._model_config)(batch)
+    def forward_fn(batch, mode=None):
+      return model.Model(self._model_config)(batch, mode=mode)
 
     return functools.partial(
-        jax.jit(forward_fn.apply, device=self._device), self.model_params
+        jax.jit(forward_fn.apply, static_argnames=["mode"], device=self._device), self.model_params
     )
 
   def run_inference(
-      self, featurised_example: features.BatchDict, rng_key: jnp.ndarray
+      self, featurised_example: features.BatchDict, rng_key: jnp.ndarray, mode: str | None = None
   ) -> model.ModelResult:
-    """Computes a forward pass of the model on a featurised example."""
+    """Computes a forward pass of the model on a featurised example.
+    
+    Args:
+        featurised_example: Featurized input data.
+        rng_key: JAX random key.
+        mode: Optional mode to run the model in. Options:
+            None (default): Standard prediction mode.
+            "boltz_design": BoltzDesign1 mode that stops gradients at the structure module.
+            
+    Returns:
+        Model results from the forward pass.
+    """
     featurised_example = jax.device_put(
         jax.tree_util.tree_map(
             jnp.asarray, utils.remove_invalidly_typed_feats(featurised_example)
@@ -437,15 +448,26 @@ class ModelRunner:
         self._device,
     )
 
-    result = self._model(rng_key, featurised_example)
-    result = jax.tree.map(np.asarray, result)
-    result = jax.tree.map(
-        lambda x: x.astype(jnp.float32) if x.dtype == jnp.bfloat16 else x,
-        result,
-    )
+    result = self._model(rng_key, featurised_example, mode)
+    
+    # Skip NumPy conversion when in boltz_design mode to avoid TracerArrayConversionError
+    # This is needed because boltz_design mode runs within a JAX JIT context
+    if mode != "boltz_design":
+      # Only convert to numpy arrays when not in boltz_design mode
+      result = jax.tree.map(np.asarray, result)
+      result = jax.tree.map(
+          lambda x: x.astype(jnp.float32) if x.dtype == jnp.bfloat16 else x,
+          result,
+      )
+    
     result = dict(result)
-    identifier = self.model_params['__meta__']['__identifier__'].tobytes()
-    result['__identifier__'] = identifier
+    
+    # Add identifier only in standard mode, not in boltz_design mode
+    # since bytes values cause errors in JIT contexts
+    if mode != "boltz_design":
+      identifier = self.model_params['__meta__']['__identifier__'].tobytes()
+      result['__identifier__'] = identifier
+    
     return result
 
   def extract_inference_results_and_maybe_embeddings(
