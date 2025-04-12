@@ -243,7 +243,7 @@ def calculate_boltz_binder_loss(partial_result, feature_dict, target_indices, bi
     """Calculate loss for BoltzDesign1-like binder design.
     
     Args:
-        partial_result: Partial model result (distogram and confidence heads).
+        partial_result: Partial model result (distogram and confidence outputs directly in dict).
         feature_dict: Feature dictionary.
         target_indices: Indices of the target residues. 
         binder_indices: Indices of the binder residues.
@@ -271,10 +271,6 @@ def calculate_boltz_binder_loss(partial_result, feature_dict, target_indices, bi
 
     # Log partial_result keys
     logging.info(f"partial_result keys: {list(partial_result.keys())}")
-    if 'distogram' in partial_result:
-        logging.info(f"distogram keys: {list(partial_result['distogram'].keys())}")
-    if 'confidence_outputs' in partial_result:
-        logging.info(f"confidence_outputs keys: {list(partial_result['confidence_outputs'].keys())}")
     
     # Log design weights
     weights = design_params.get("weights", {})
@@ -300,80 +296,69 @@ def calculate_boltz_binder_loss(partial_result, feature_dict, target_indices, bi
                 distogram_loss = get_distogram_contact_loss(
                     distogram_result, target_indices, binder_indices
                 )
-                # Use where instead of direct if-check for JAX compatibility
                 losses['distogram'] = jnp.where(
                     jnp.isnan(distogram_loss) | jnp.isinf(distogram_loss),
                     jnp.array(0.0, dtype=distogram_loss.dtype),
                     distogram_loss
                 )
-                # Don't log JAX arrays directly inside a JIT-compiled function
             except Exception as e:
-                # logging.error("Error in distogram loss calculation: %s", e)
-                # Use a constant loss value that won't cause gradients to explode
                 logging.error(f"Error in distogram loss calculation (not logging full error due to JIT): {type(e)}")
                 losses['distogram'] = jnp.array(0.0, dtype=jnp.float32)
         else:
-            # logging.warning("Distogram weight > 0 but 'distogram' not in partial_result")
             logging.warning("Distogram weight > 0 but 'distogram' not in partial_result, skipping")
             pass
     
+    # Check for confidence weight > 0 before accessing confidence keys
     if weights.get('confidence', 0.0) > 0:
-        if 'confidence_outputs' in partial_result:
-            # Use confidence module outputs for pLDDT and PAE-based losses
-            confidence_output = partial_result['confidence_outputs']
-            
-            if 'predicted_lddt' in confidence_output:
-                try:
-                    logging.info(f"Calculating pLDDT loss with binder shape: {binder_indices.shape}")
-                    plddt_loss = get_binder_plddt_loss(confidence_output, binder_indices)
-                    # Use where instead of direct if-check for JAX compatibility
-                    losses['plddt'] = jnp.where(
-                        jnp.isnan(plddt_loss) | jnp.isinf(plddt_loss),
-                        jnp.array(0.0, dtype=plddt_loss.dtype),
-                        plddt_loss
-                    )
-                    # Don't log JAX arrays directly inside a JIT-compiled function
-                except Exception as e:
-                    # logging.error("Error in pLDDT loss calculation: %s", e)
-                    # No need to set losses['plddt'] as it's already initialized to 0
-                    logging.error(f"Error in pLDDT loss calculation (not logging full error due to JIT): {type(e)}")
-                    pass
-            
-            if 'full_pae' in confidence_output:
-                try:
-                    logging.info(f"Calculating PAE loss with shapes - target: {target_indices.shape}, binder: {binder_indices.shape}")
-                    pae_loss = get_interface_pae_loss(confidence_output, target_indices, binder_indices)
-                    # Use where instead of direct if-check for JAX compatibility
-                    losses['pae'] = jnp.where(
-                        jnp.isnan(pae_loss) | jnp.isinf(pae_loss),
-                        jnp.array(0.0, dtype=pae_loss.dtype),
-                        pae_loss
-                    )
-                    # Don't log JAX arrays directly inside a JIT-compiled function
-                except Exception as e:
-                    # logging.error("Error in PAE loss calculation: %s", e)
-                    # No need to set losses['pae'] as it's already initialized to 0
-                    logging.error(f"Error in PAE loss calculation (not logging full error due to JIT): {type(e)}")
-                    pass
+        confidence_calculated = False # Flag to track if any confidence loss was calculated
+        # Access confidence keys directly from partial_result
+        if 'predicted_lddt' in partial_result:
+            try:
+                logging.info(f"Calculating pLDDT loss with binder shape: {binder_indices.shape}")
+                # Pass partial_result directly as it contains predicted_lddt
+                plddt_loss = get_binder_plddt_loss(partial_result, binder_indices)
+                losses['plddt'] = jnp.where(
+                    jnp.isnan(plddt_loss) | jnp.isinf(plddt_loss),
+                    jnp.array(0.0, dtype=plddt_loss.dtype),
+                    plddt_loss
+                )
+                confidence_calculated = True
+            except Exception as e:
+                logging.error(f"Error in pLDDT loss calculation (not logging full error due to JIT): {type(e)}")
+                pass
         else:
-            # logging.warning("Confidence weight > 0 but 'confidence_outputs' not in partial_result")
-            logging.warning("Confidence weight > 0 but 'confidence_outputs' not in partial_result, skipping")
-            pass
-    
+            logging.warning("Confidence weight > 0 but 'predicted_lddt' not in partial_result")
+
+        if 'full_pae' in partial_result:
+            try:
+                logging.info(f"Calculating PAE loss with shapes - target: {target_indices.shape}, binder: {binder_indices.shape}")
+                 # Pass partial_result directly as it contains full_pae
+                pae_loss = get_interface_pae_loss(partial_result, target_indices, binder_indices)
+                losses['pae'] = jnp.where(
+                    jnp.isnan(pae_loss) | jnp.isinf(pae_loss),
+                    jnp.array(0.0, dtype=pae_loss.dtype),
+                    pae_loss
+                )
+                confidence_calculated = True
+            except Exception as e:
+                logging.error(f"Error in PAE loss calculation (not logging full error due to JIT): {type(e)}")
+                pass
+        else:
+             logging.warning("Confidence weight > 0 but 'full_pae' not in partial_result")
+
+        if not confidence_calculated:
+             logging.warning("Confidence weight > 0 but required keys ('predicted_lddt', 'full_pae') were missing from partial_result. Confidence loss is 0.")
+
     if weights.get('seq_entropy', 0.0) > 0:
         try:
             logging.info(f"Calculating sequence entropy loss with logits shape: {binder_seq_logits.shape}")
             entropy_loss = get_binder_seq_entropy_loss(binder_seq_logits)
-            # Use where instead of direct if-check for JAX compatibility
             losses['seq_entropy'] = jnp.where(
                 jnp.isnan(entropy_loss) | jnp.isinf(entropy_loss),
                 jnp.array(0.0, dtype=entropy_loss.dtype),
                 entropy_loss
             )
-            # Don't log JAX arrays directly inside a JIT-compiled function
         except Exception as e:
-            # logging.error("Error in sequence entropy loss calculation: %s", e)
-            # No need to set losses['seq_entropy'] as it's already initialized to 0
             logging.error(f"Error in sequence entropy loss calculation (not logging full error due to JIT): {type(e)}")
             pass
 

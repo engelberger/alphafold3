@@ -2,8 +2,9 @@
 
 import time
 import functools
-from typing import Dict, Any, Tuple, List, Callable, Optional, Sequence
+from typing import Dict, Any, Tuple, Sequence 
 import datetime
+import gc
 
 import jax
 import jax.numpy as jnp
@@ -19,6 +20,8 @@ from alphafold3.model.network import distogram_head
 from alphafold3.model.network import confidence_head
 from alphafold3.design import binder_utils
 from alphafold3.design import binder_loss
+from alphafold3.design import memory_utils
+from alphafold3.constants import residue_names
 
 
 class BinderDesigner:
@@ -42,8 +45,13 @@ class BinderDesigner:
         self.design_params = design_params
         self.protocol = design_params.get("protocol", "binder_gradient")
         
+        # Setup memory optimization parameters
+        self.clear_memory_interval = design_params.get("clear_memory_interval", 0)
+        
         logging.info(f"Initialized BinderDesigner with protocol: {self.protocol}")
         logging.info(f"Design parameters: {design_params}")
+        if self.clear_memory_interval > 0:
+            logging.info(f"Memory clearing enabled: clearing every {self.clear_memory_interval} steps")
     
     def design_binder(
         self, 
@@ -109,6 +117,7 @@ class BinderDesigner:
         Returns:
             Tuple of (design_results, final_feature_dict).
         """
+        from alphafold3.common import memory_utils
         logging.info("Starting gradient-based binder design...")
         design_start_time = time.time()
         
@@ -170,7 +179,8 @@ class BinderDesigner:
                 curr_binder_logits, design_params_static
             )
             
-            return total_loss, (loss_breakdown, result, updated_feature_dict)
+            # Return only the loss breakdown as auxiliary data to prevent memory leaks
+            return total_loss, loss_breakdown
         
         grad_fn = jax.value_and_grad(loss_fn_for_grad, has_aux=True)
         
@@ -185,7 +195,7 @@ class BinderDesigner:
             step_key, rng_key = jax.random.split(rng_key)
             
             # Compute gradients
-            (loss, (losses, result, updated_feature_dict)), grads = grad_fn(
+            (loss, losses), grads = grad_fn(
                 binder_seq_logits, feature_dict_jax, target_indices, binder_indices, 
                 self.design_params, self.model_runner, step_key
             )
@@ -204,10 +214,13 @@ class BinderDesigner:
                 probs = jax.nn.softmax(binder_seq_logits, axis=-1)
                 aa_indices = jnp.argmax(probs, axis=-1)
                 
-                # Convert to amino acid sequence using the data_constants mapping
-                import string
-                aa_letters = list(string.ascii_uppercase)[:20]  # Simple A-T for 20 amino acids
-                current_seq = ''.join([aa_letters[idx] for idx in aa_indices])
+                # Convert to amino acid sequence using proper residue names
+                # Standard amino acid types in order
+                aa_letters = 'ACDEFGHIKLMNPQRSTVWY'
+                
+                # Convert JAX array indices to Python integers first
+                aa_indices_py = [int(idx) for idx in aa_indices]
+                current_seq = ''.join([aa_letters[idx] for idx in aa_indices_py])
                 
                 logging.info(f"Step {step}/{steps}: loss={safe_jax_to_float(step_loss_val):.4f}, time={step_time:.2f}s")
                 safe_losses = safe_process_losses(step_losses_val)
@@ -225,7 +238,35 @@ class BinderDesigner:
             if step_loss_val < best_loss:
                 best_loss = step_loss_val
                 best_logits = binder_seq_logits
-                best_feature_dict = updated_feature_dict
+                
+                # Since we no longer get updated_feature_dict from grad_fn due to OOM prevention,
+                # we need to regenerate it for the best state when needed
+                # We'll only do this when we find a new best loss to limit computational overhead
+                logging.info(f"Step {step}/{steps}: Regenerating feature dict for new best solution")
+                best_feature_dict = binder_utils.update_features_from_logits(
+                    jax.tree_map(lambda x: x.copy() if isinstance(x, (jnp.ndarray, np.ndarray)) else x, feature_dict_jax),
+                    jnp.array(binder_indices, dtype=jnp.int32),
+                    best_logits
+                )
+                
+                logging.info(f"Step {step}/{steps}: New best loss {safe_jax_to_float(best_loss):.4f}")
+            
+            # Periodically clear memory if enabled
+            if self.clear_memory_interval > 0 and step % self.clear_memory_interval == 0:
+                logging.info(f"Step {step}/{steps}: Executing scheduled memory clearing")
+                
+                # Log memory usage before clearing
+                mem_usage = memory_utils.get_current_memory_usage()
+                if mem_usage:
+                    logging.info(f"Before memory clearing: {mem_usage}")
+                
+                # Clear memory
+                memory_utils.clear_memory(include_gpu=True, include_cpu=True)
+                
+                # Log memory usage after clearing
+                mem_usage = memory_utils.get_current_memory_usage()
+                if mem_usage:
+                    logging.info(f"After memory clearing: {mem_usage}")
         
         # Final sequence
         final_probs = jax.nn.softmax(best_logits, axis=-1)
@@ -240,7 +281,7 @@ class BinderDesigner:
             "trajectory": trajectory,
             "design_time": time.time() - design_start_time,
             "final_seq_logits": best_logits,
-            "final_aa_indices": final_aa_indices,
+            "final_aa_indices": [int(aa) for aa in final_aa_indices],  # Convert to Python list of integers
         }
         
         logging.info(f"Gradient-based binder design completed in {design_results['design_time']:.2f}s")
@@ -291,10 +332,11 @@ class BinderDesigner:
         result_keys = list(boltz_result.keys())
         logging.info(f"Boltz forward pass returned keys: {result_keys}")
         
-        expected_keys = ['distogram', 'confidence_outputs']
+        # Updated check: Look for top-level keys needed by the loss function
+        expected_keys = ['distogram', 'predicted_lddt', 'full_pae'] 
         missing_result_keys = [k for k in expected_keys if k not in result_keys]
         if missing_result_keys:
-            logging.warning(f"Missing expected keys in boltz_result: {missing_result_keys}")
+            logging.warning(f"Potentially missing expected keys in boltz_result needed for loss: {missing_result_keys}")
         
         # Check distogram shape if present
         if 'distogram' in boltz_result:
@@ -303,17 +345,6 @@ class BinderDesigner:
             if 'contact_probs' in boltz_result['distogram']:
                 contact_shape = boltz_result['distogram']['contact_probs'].shape
                 logging.info(f"Contact_probs shape: {contact_shape}")
-        
-        # Check confidence outputs if present 
-        if 'confidence_outputs' in boltz_result:
-            confidence_keys = list(boltz_result['confidence_outputs'].keys())
-            logging.info(f"Confidence_outputs contains keys: {confidence_keys}")
-            for key in confidence_keys:
-                try:
-                    shape = boltz_result['confidence_outputs'][key].shape
-                    logging.info(f"  - {key} shape: {shape}")
-                except:
-                    logging.info(f"  - {key} shape: unknown (couldn't determine)")
         
         logging.info("Ran BoltzDesign forward pass successfully using main model with 'boltz_design' mode")
         return boltz_result
@@ -338,7 +369,8 @@ class BinderDesigner:
         Returns:
             Tuple of (design_results, final_feature_dict).
         """
-        logging.info("Starting BoltzDesign1-like binder design...")
+        from alphafold3.common import memory_utils
+        logging.info("Starting Boltz-like binder design...")
         design_start_time = time.time()
         
         # Keep original feature_dict as template
@@ -487,7 +519,10 @@ class BinderDesigner:
                 (total_loss, loss_breakdown)
             )
             
-            return total_loss, (updated_breakdown, boltz_result, updated_feature_dict)
+            # Return only the loss breakdown as auxiliary data, not the full boltz_result or feature_dict
+            # This is critical to avoid OOM errors during gradient computation by preventing large tensors 
+            # from being included in the computation graph.
+            return total_loss, updated_breakdown
         
         # Define the gradient function directly on the loss function
         grad_loss_fn = jax.value_and_grad(loss_fn_for_grad_boltz, argnums=0, has_aux=True)
@@ -528,6 +563,12 @@ class BinderDesigner:
                 step_start_time = time.time()
                 step_key, rng_key = jax.random.split(rng_key)
                 
+                # Check if memory should be cleared 
+                if hasattr(self, 'clear_memory_interval') and self.clear_memory_interval > 0:
+                    if current_step % self.clear_memory_interval == 0:
+                        logging.info(f"Stage {stage_idx+1}, Step {step}/{stage_steps}: Clearing memory")
+                        memory_utils.clear_mem()
+                
                 # Update temperature for stage 3 (gradually decreasing)
                 if stage_idx == 2:
                     # Temperature decreases quadratically from 0.5 to 0.01
@@ -544,7 +585,9 @@ class BinderDesigner:
                 step_success = False
                 
                 try:
-                    (loss, (losses, partial_result, updated_feature_dict)), grads = grad_fn(
+                    # Calling grad_fn with the boltz approach returns only (loss, losses) as aux data,
+                    # not the full (updated_breakdown, boltz_result, updated_feature_dict) which caused OOM
+                    (loss, losses), grads = grad_fn(
                         binder_seq_logits,          # Arg 0
                         stage_idx,                  # Arg 1
                         temp,                       # Arg 2
@@ -611,8 +654,36 @@ class BinderDesigner:
                     if step_loss_val < best_loss:
                         best_loss = step_loss_val
                         best_logits = binder_seq_logits
-                        best_feature_dict = updated_feature_dict
+                        
+                        # Since we no longer get updated_feature_dict from grad_fn due to OOM prevention,
+                        # we need to regenerate it for the best state when needed
+                        # We'll only do this when we find a new best loss to limit computational overhead
+                        logging.info(f"Stage {stage_idx+1}, Step {step}/{stage_steps}: Regenerating feature dict for new best solution")
+                        best_feature_dict = binder_utils.update_features_from_logits(
+                            jax.tree_map(lambda x: x.copy() if isinstance(x, (jnp.ndarray, np.ndarray)) else x, feature_dict_template),
+                            jnp.array(binder_indices_static_tuple, dtype=jnp.int32),
+                            best_logits
+                        )
+                        
                         logging.info(f"Stage {stage_idx+1}, Step {step}/{stage_steps}: New best loss {safe_jax_to_float(best_loss):.4f}")
+                    
+                    # Periodically clear memory if enabled
+                    if self.clear_memory_interval > 0 and step % self.clear_memory_interval == 0:
+                        logging.info(f"Stage {stage_idx+1}, Step {step}/{stage_steps}: Executing scheduled memory clearing")
+                        
+                        # Log memory usage before clearing
+                        mem_usage = memory_utils.get_current_memory_usage()
+                        if mem_usage:
+                            logging.info(f"Before memory clearing: {mem_usage}")
+                        
+                        # Clear memory
+                        memory_utils.clear_memory(include_gpu=True, include_cpu=True)
+                        
+                        # Log memory usage after clearing
+                        mem_usage = memory_utils.get_current_memory_usage()
+                        if mem_usage:
+                            logging.info(f"After memory clearing: {mem_usage}")
+                
                 except Exception as e:
                     logging.error(f"❌ Error in Stage {stage_idx+1}, Step {step}/{stage_steps}: {e}", exc_info=True)
                     # Don't immediately re-raise, try to continue with next step
@@ -623,10 +694,13 @@ class BinderDesigner:
                     probs = jax.nn.softmax(binder_seq_logits / temp, axis=-1)
                     aa_indices = jnp.argmax(probs, axis=-1)
                     
-                    # Convert to amino acid sequence using the data_constants mapping
-                    import string
-                    aa_letters = list(string.ascii_uppercase)[:20]  # Simple A-T for 20 amino acids
-                    current_seq = ''.join([aa_letters[idx] for idx in aa_indices])
+                    # Convert to amino acid sequence using proper residue names
+                    # Standard amino acid types in order
+                    aa_letters = 'ACDEFGHIKLMNPQRSTVWY'
+                    
+                    # Convert JAX array indices to Python integers first
+                    aa_indices_py = [int(idx) for idx in aa_indices]
+                    current_seq = ''.join([aa_letters[idx] for idx in aa_indices_py])
                     
                     logging.info(f"Stage {stage_idx+1}, Step {step}/{stage_steps}: loss={safe_jax_to_float(step_loss_val):.4f}, time={step_time:.2f}s")
                     safe_losses = safe_process_losses(step_losses_val)
@@ -683,10 +757,13 @@ class BinderDesigner:
         logging.info(f"Designed sequence length: {len(final_aa_indices)}")
         
         # Get amino acid sequence
-        from alphafold3.data import data_constants
-        residue_constants = data_constants.get_residue_constants()
-        restype_idx_to_letter = residue_constants["restype_idx_to_letter"]
-        final_sequence = ''.join([restype_idx_to_letter[aa] for aa in final_aa_indices])
+        # Create a mapping from index to one-letter codes
+        restype_idx_to_letter = {i: aa for i, aa in enumerate('ACDEFGHIKLMNPQRSTVWY')}
+        
+        # Convert JAX array elements to Python integers first
+        final_aa_indices_py = [int(aa) for aa in final_aa_indices]
+        final_sequence = ''.join([restype_idx_to_letter[aa] for aa in final_aa_indices_py])
+        
         logging.info(f"Designed sequence: {final_sequence}")
         logging.info("======================================")
         
@@ -698,7 +775,7 @@ class BinderDesigner:
             "best_loss": best_loss,
             "trajectory": trajectory,
             "design_time": time.time() - design_start_time,
-            "final_aa_indices": final_aa_indices,
+            "final_aa_indices": [int(aa) for aa in final_aa_indices],  # Convert to Python list of integers
             "final_sequence": final_sequence,
             "success": any(stage_success),
             "stage_success": stage_success
@@ -736,16 +813,13 @@ class BinderDesigner:
             # Get the final amino acid indices from the design results
             final_aa_indices = design_results["final_aa_indices"]
             
-            # Convert to amino acid sequence using a proper mapping from data_constants
-            try:
-                from alphafold3.model import data_constants
-                aa_types = data_constants.protein_restypes
-            except (ImportError, AttributeError):
-                # Fallback to standard alphabet if data_constants is not available
-                aa_types = list("ACDEFGHIKLMNPQRSTVWY")
+            # Convert to amino acid sequence using residue names constants
+            from alphafold3.constants import residue_names
+            # Standard amino acid types in order
+            aa_types = 'ACDEFGHIKLMNPQRSTVWY'
             
             # Map indices to amino acid sequences
-            designed_sequence = ''.join([aa_types[idx] for idx in final_aa_indices])
+            designed_sequence = ''.join([aa_types[int(idx)] for idx in final_aa_indices])
             logging.info(f"Designed sequence ({len(designed_sequence)} aa): {designed_sequence[:50]}...")
             
             # Create a new fold_input with the designed sequence
@@ -871,16 +945,13 @@ class BinderDesigner:
         # Get the final amino acid indices from the design results
         final_aa_indices = design_results["final_aa_indices"]
         
-        # Convert to amino acid sequence using a proper mapping from data_constants
-        try:
-            from alphafold3.model import data_constants
-            aa_types = data_constants.protein_restypes
-        except (ImportError, AttributeError):
-            # Fallback to standard alphabet if data_constants is not available
-            aa_types = list("ACDEFGHIKLMNPQRSTVWY")
+        # Convert to amino acid sequence using residue names constants
+        from alphafold3.constants import residue_names
+        # Standard amino acid types in order
+        aa_types = 'ACDEFGHIKLMNPQRSTVWY'
         
         # Map indices to amino acid sequences
-        designed_sequence = ''.join([aa_types[idx] for idx in final_aa_indices])
+        designed_sequence = ''.join([aa_types[int(idx)] for idx in final_aa_indices])
         logging.info(f"Designed sequence ({len(designed_sequence)} aa): {designed_sequence[:50]}...")
         
         # Create a new fold_input with the designed sequence

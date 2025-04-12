@@ -302,6 +302,14 @@ _DESIGN_SEQ_ENTROPY_WEIGHT = flags.DEFINE_float(
     'design_seq_entropy_weight', 0.01, 'Weight for sequence entropy loss.'
 )
 
+_CLEAR_MEMORY_INTERVAL = flags.DEFINE_integer(
+    'clear_memory_interval', 
+    0, 
+    'Interval (in steps) at which to clear GPU/CPU memory during binder design. '
+    'Set to 0 to disable memory clearing. '
+    'Values between 10-50 are recommended for GPUs with limited memory.'
+)
+
 # Gradient-Specific Parameters
 _GRADIENT_PLDDT_WEIGHT = flags.DEFINE_float(
     'gradient_plddt_weight', 0.5, 'Weight for binder pLDDT loss (gradient protocol).'
@@ -1230,6 +1238,8 @@ def main(_):
             "distogram": FLAGS.boltz_distogram_weight,
             "confidence": FLAGS.boltz_confidence_weight,
         })
+        # Add clear_memory_interval to enable memory optimization
+        design_params["clear_memory_interval"] = FLAGS.clear_memory_interval
   else:
     logging.info("Running standard folding protocol.")
   # ---------------------------
