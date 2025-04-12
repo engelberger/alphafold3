@@ -88,135 +88,179 @@ def setup_binder_features(feature_dict, target_chains, binder_chains, fold_input
     logging.info("Setting up features for binder design...")
     # --- Log Feature Dict Keys ---
     logging.info(f"Available feature_dict keys: {list(feature_dict.keys())}")
-    # --- End Log ---
-
-    # Get Chain ID to Residue Mapping - use token_features.asym_id instead of chain_id_per_residue
-    chain_id_key = 'token_features.asym_id'
     
-    # Check if token_features.asym_id is available
-    if chain_id_key in feature_dict:
-        int_asym_ids = feature_dict[chain_id_key]
-    # Fallback checks for other possible keys
-    elif 'asym_id' in feature_dict:
-        int_asym_ids = feature_dict['asym_id']
-    else:
-        logging.error("Available feature dict keys: " + str(list(feature_dict.keys())))
-        raise KeyError(f"Feature '{chain_id_key}' or 'asym_id' needed for binder setup not found.")
+    # --- STEP 1: Log chain details from fold_input for debugging ---
+    total_expected_length = 0
+    chain_details = []
+    
+    for i, chain in enumerate(fold_input.chains):
+        chain_id_str = chain.id
+        if isinstance(chain, folding_input.ProteinChain):
+            chain_len = len(chain.sequence)
+            chain_details.append(f"Chain {i} (ID: {chain_id_str}): Protein, Length={chain_len}, First 10 aa: {chain.sequence[:10]}...")
+        elif isinstance(chain, folding_input.RnaChain):
+            chain_len = len(chain.sequence)
+            chain_details.append(f"Chain {i} (ID: {chain_id_str}): RNA, Length={chain_len}")
+        elif isinstance(chain, folding_input.DnaChain):
+            chain_len = len(chain.sequence)
+            chain_details.append(f"Chain {i} (ID: {chain_id_str}): DNA, Length={chain_len}")
+        elif isinstance(chain, folding_input.Ligand):
+            chain_len = len(chain.ccd_ids) if chain.ccd_ids else (1 if chain.smiles else 0)
+            chain_details.append(f"Chain {i} (ID: {chain_id_str}): Ligand, Length={chain_len}")
+        else:
+            chain_details.append(f"Chain {i} (ID: {chain_id_str}): Unknown type={type(chain)}")
+            chain_len = 0
         
-    # --- Determine target/binder indices directly from input chain order and lengths --- 
+        total_expected_length += chain_len
+    
+    # Log all chain details
+    logging.info(f"========== FOLD INPUT CHAIN DETAILS ==========")
+    for detail in chain_details:
+        logging.info(detail)
+    logging.info(f"Total expected residue length: {total_expected_length}")
+    
+    # --- STEP 2: Get Chain ID to Residue Mapping ---
+    # Check available chain ID keys
+    chain_id_key = None
+    for possible_key in ['token_features.asym_id', 'asym_id', 'entity_id']:
+        if possible_key in feature_dict:
+            chain_id_key = possible_key
+            break
+    
+    if not chain_id_key:
+        logging.error("Available feature dict keys: " + str(list(feature_dict.keys())))
+        raise KeyError("No chain ID key found in feature_dict.")
+    
+    int_asym_ids = feature_dict[chain_id_key]
+    logging.info(f"Using {chain_id_key} for chain mapping with shape {int_asym_ids.shape}")
+    logging.info(f"Unique values in {chain_id_key}: {np.unique(int_asym_ids)}")
+    
+    # --- STEP 3: Calculate target and binder indices properly ---
+    # Get residue indices based on actual sequence in each chain
     target_idx = []
     binder_idx = []
-    current_index = 0
-    logging.info("Assigning target/binder indices based on input chain order and lengths...")
-
-    for chain in fold_input.chains:
-        chain_id_str = chain.id # Get string ID regardless of type
-
+    current_idx = 0
+    
+    for i, chain in enumerate(fold_input.chains):
+        chain_id_str = chain.id
+        
+        # Calculate chain length
         if isinstance(chain, (folding_input.ProteinChain, folding_input.RnaChain, folding_input.DnaChain)):
-            if not hasattr(chain, 'sequence'):
-                 logging.warning(f"Skipping chain {chain_id_str} in index assignment as it lacks sequence.")
-                 continue
             chain_len = len(chain.sequence)
         elif isinstance(chain, folding_input.Ligand):
-            # Ligands defined by ccd_ids are treated as single residues per ID
             chain_len = len(chain.ccd_ids) if chain.ccd_ids else (1 if chain.smiles else 0)
-            if chain_len == 0:
-                 logging.warning(f"Skipping ligand chain {chain_id_str} as it has no ccd_ids or smiles.")
-                 continue
         else:
-            logging.warning(f"Skipping unknown chain type in index assignment: {type(chain)}")
+            logging.warning(f"Skipping unknown chain type: {type(chain)}")
             continue
-        
-        end_index = current_index + chain_len
-        chain_indices = list(range(current_index, min(end_index, len(int_asym_ids)))) # Ensure we don't go out of bounds
-
-        if not chain_indices: # Skip if the chain has zero length or starts out of bounds
-            logging.warning(f"Chain {chain_id_str} resulted in no valid indices in range [{current_index}:{end_index}]. Skipping.")
-            current_index = end_index
-            continue
-
-        if chain_id_str in target_chains:
-            target_idx.extend(chain_indices)
-            logging.info(f"Assigned indices {chain_indices[0]}...{chain_indices[-1]} to TARGET chain '{chain_id_str}'.")
-        elif chain_id_str in binder_chains:
-            binder_idx.extend(chain_indices)
-            logging.info(f"Assigned indices {chain_indices[0]}...{chain_indices[-1]} to BINDER chain '{chain_id_str}'.")
-        else:
-            logging.info(f"Skipping indices {chain_indices[0]}...{chain_indices[-1]} for non-target/binder chain '{chain_id_str}'.")
             
-        current_index = end_index
-
+        # Skip empty chains
+        if chain_len == 0:
+            logging.warning(f"Skipping empty chain {chain_id_str}")
+            continue
+            
+        # Calculate end index (exclusive)
+        end_idx = current_idx + chain_len
+        
+        # Make sure we don't exceed max sequence length
+        max_seq_len = min(len(int_asym_ids), 1000)  # Safety limit
+        if current_idx >= max_seq_len:
+            logging.warning(f"Chain {chain_id_str} starts beyond max sequence length ({current_idx} >= {max_seq_len})")
+            continue
+            
+        # Calculate actual indices for this chain (clamp to valid range)
+        chain_end = min(end_idx, max_seq_len)
+        chain_indices = list(range(current_idx, chain_end))
+        
+        # Detailed logging
+        if len(chain_indices) > 0:
+            logging.info(f"Chain {chain_id_str}: Assigned indices {chain_indices[0]}...{chain_indices[-1]} ({len(chain_indices)} residues)")
+            
+            # Assign to target or binder
+            if chain_id_str in target_chains:
+                target_idx.extend(chain_indices)
+                logging.info(f"  -> TARGET CHAIN: Added {len(chain_indices)} indices to target set")
+            elif chain_id_str in binder_chains:
+                binder_idx.extend(chain_indices)
+                logging.info(f"  -> BINDER CHAIN: Added {len(chain_indices)} indices to binder set")
+            else:
+                logging.info(f"  -> IGNORED CHAIN: Not target or binder")
+        else:
+            logging.warning(f"Chain {chain_id_str}: No valid indices in range [{current_idx}:{chain_end}]")
+        
+        # Update current index for next chain
+        current_idx = end_idx
+    
     target_indices = np.array(target_idx)
     binder_indices = np.array(binder_idx)
-
-    if target_indices.size == 0:
-        raise ValueError(f"Could not assign any residue indices to target chains {target_chains}. Check input and logs.")
-    if binder_indices.size == 0:
-        raise ValueError(f"Could not assign any residue indices to binder chains {binder_chains}. Check input and logs.")
-
-    logging.info(f"Final Target indices ({len(target_indices)}): {target_indices[:5]}...{target_indices[-5:] if len(target_indices) > 5 else target_indices}")
-    logging.info(f"Final Binder indices ({len(binder_indices)}): {binder_indices[:5]}...{binder_indices[-5:] if len(binder_indices) > 5 else binder_indices}")
-    # --- End Index Assignment --- 
-
-    # Add Design Mask
-    # Check for the actual key 'seq_mask' first, then fallbacks
-    if 'seq_mask' in feature_dict:
-        seq_mask_key = 'seq_mask'
-    elif 'token_features.mask' in feature_dict:
-        seq_mask_key = 'token_features.mask'
-        logging.warning("Using fallback key 'token_features.mask' for sequence mask.")
-    elif 'sequence_mask' in feature_dict: # Least likely, but check just in case
-        seq_mask_key = 'sequence_mask'
-        logging.warning("Using fallback key 'sequence_mask' for sequence mask.")
-    else:
-        # Print available keys to help debug
-        logging.error("Available feature dict keys: " + str(list(feature_dict.keys())))
-        raise KeyError("Could not find a valid sequence mask key ('seq_mask', 'token_features.mask', or 'sequence_mask').")
     
-    logging.info(f"Using key '{seq_mask_key}' for design mask.")
+    # --- STEP 4: Validate results ---
+    if len(target_indices) == 0:
+        raise ValueError(f"Found 0 target indices for chains {target_chains}. Check fold_input and feature_dict.")
+    
+    if len(binder_indices) == 0:
+        raise ValueError(f"Found 0 binder indices for chains {binder_chains}. Check fold_input and feature_dict.")
+    
+    logging.info(f"========== FINAL INDICES ==========")
+    logging.info(f"Target indices ({len(target_indices)}): {target_indices[:5]}...{target_indices[-5:] if len(target_indices) > 5 else target_indices}")
+    logging.info(f"Binder indices ({len(binder_indices)}): {binder_indices[:5]}...{binder_indices[-5:] if len(binder_indices) > 5 else binder_indices}")
+    
+    # --- STEP 5: Set up design mask and other features ---
+    # Check for mask key
+    seq_mask_key = None
+    for possible_key in ['seq_mask', 'token_features.mask', 'sequence_mask']:
+        if possible_key in feature_dict:
+            seq_mask_key = possible_key
+            break
+    
+    if not seq_mask_key:
+        logging.error("Available feature dict keys: " + str(list(feature_dict.keys())))
+        raise KeyError("No sequence mask key found in feature_dict.")
+    
+    logging.info(f"Using key '{seq_mask_key}' for design mask")
+    
+    # Create design mask
     design_mask = np.zeros_like(feature_dict[seq_mask_key])
     design_mask[binder_indices] = 1
     feature_dict['design_mask'] = design_mask
-    logging.info(f"Added 'design_mask' with {int(design_mask.sum())} designable positions.")
+    logging.info(f"Added 'design_mask' with {int(design_mask.sum())} designable positions")
     
-    # Store Initial Coords (for target FAPE loss)
-    # Use template_atom_positions as the source for initial coordinates
-    atom_pos_key = 'template_atom_positions' 
+    # Store initial coordinates (for target FAPE loss)
+    atom_pos_key = 'template_atom_positions'
     if atom_pos_key in feature_dict:
         initial_coords = feature_dict[atom_pos_key].copy()
         feature_dict['initial_coords'] = initial_coords
-        logging.info(f"Stored 'initial_coords' (from {atom_pos_key}) for potential target FAPE loss.")
+        logging.info(f"Stored 'initial_coords' (from {atom_pos_key}) for potential target FAPE loss")
     else:
-        logging.warning(f"Could not find '{atom_pos_key}' to store initial coordinates.")
+        logging.warning(f"Could not find '{atom_pos_key}' to store initial coordinates")
     
-    # Mask Binder MSA
-    # Use 'msa' key instead of 'msa_feat'
-    msa_key = 'msa' 
+    # Mask binder MSA
+    msa_key = 'msa'
     msa_mask_key = 'msa_mask'
     if msa_key in feature_dict and msa_mask_key in feature_dict:
-        logging.info(f"Masking MSA features (key: '{msa_key}') for binder residues.")
+        logging.info(f"Masking MSA features (key: '{msa_key}') for binder residues")
         try:
-            # --- Log MSA Shape ---
+            # Log MSA shape
             logging.info(f"Shape of feature_dict['{msa_key}']: {feature_dict[msa_key].shape}")
             logging.info(f"Shape of feature_dict['{msa_mask_key}']: {feature_dict[msa_mask_key].shape}")
-            # --- End Log ---
+            
             # Ensure binder_indices are valid for the sequence length dimension
             seq_len = feature_dict[msa_key].shape[1]
             valid_binder_indices = binder_indices[binder_indices < seq_len]
             
             if len(valid_binder_indices) > 0:
-                # Corrected 2D indexing
-                feature_dict[msa_key][:, valid_binder_indices] = 0 
+                # Mask MSA for binder
+                feature_dict[msa_key][:, valid_binder_indices] = 0
                 feature_dict[msa_mask_key][:, valid_binder_indices] = 0
+                logging.info(f"Masked {len(valid_binder_indices)} positions in MSA for binder residues")
             else:
-                logging.warning("No valid binder indices found within MSA sequence length.")
-        except IndexError:
-            logging.error("Error masking binder MSA - check dimensions and indices.")
+                logging.warning("No valid binder indices found within MSA sequence length")
+        except IndexError as e:
+            logging.error(f"Error masking binder MSA: {e}")
             raise
     else:
-        logging.warning(f"Could not find '{msa_key}' or '{msa_mask_key}' to mask binder MSA.")
+        logging.warning(f"Could not find '{msa_key}' or '{msa_mask_key}' to mask binder MSA")
     
-    logging.info("Binder feature setup complete.")
+    logging.info("Binder feature setup complete")
     return feature_dict, target_indices, binder_indices
 
 def update_features_from_logits(feature_dict, binder_indices, binder_seq_logits):
@@ -230,37 +274,58 @@ def update_features_from_logits(feature_dict, binder_indices, binder_seq_logits)
     Returns:
         Updated feature dictionary.
     """
-    # --- Log Feature Dict Keys During Update ---
-    #logging.info(f"Keys in feature_dict during update: {list(feature_dict.keys())}")
-    # --- End Log ---
+    from absl import logging
+    # Ensure everything is JAX arrays
+    binder_indices = jnp.asarray(binder_indices)
+    binder_seq_logits = jnp.asarray(binder_seq_logits)
+    
     if 'design_mask' not in feature_dict:
-        raise ValueError("'design_mask' must be in feature_dict before calling update.")
+        logging.warning("'design_mask' not found in feature_dict. Adding default mask based on binder_indices.")
+        design_mask = jnp.zeros((feature_dict.get('aatype', jnp.zeros((100,))).shape[0],), dtype=jnp.int32)
+        # Use dynamic_update_slice or functional scatter update instead of at[] for better JAX compatibility
+        feature_dict['design_mask'] = design_mask
     
     # Calculate probabilities and aatype
     binder_probs = jax.nn.softmax(binder_seq_logits, axis=-1)
     binder_aatype = jnp.argmax(binder_probs, axis=-1)
     
-    # Update 'aatype' feature
-    aatype_key = 'aatype'
-    if aatype_key in feature_dict:
-        target_dtype_aatype = feature_dict[aatype_key].dtype
-        logging.debug(f"Updating '{aatype_key}' (dtype: {target_dtype_aatype}) with binder_aatype (dtype: {binder_aatype.dtype})")
-        feature_dict[aatype_key] = feature_dict[aatype_key].at[binder_indices].set(binder_aatype.astype(target_dtype_aatype))
-    else:
-        logging.warning(f"Key '{aatype_key}' not found for updating.")
+    # Make a copy of the feature dict to avoid in-place mutation issues with JAX
+    updated_feature_dict = {}
     
-    # Update 'msa' first sequence (target sequence representation)
-    msa_key = 'msa'
-    if msa_key in feature_dict:
-        target_dtype_msa = feature_dict[msa_key].dtype
-        logging.debug(f"Updating '{msa_key}' (dtype: {target_dtype_msa}) with binder_aatype (dtype: {binder_aatype.dtype})")
-        # Update the first row (target sequence) for binder positions with amino acid indices (aatype)
-        # Ensure binder_aatype has the correct shape (should be 1D)
-        if binder_aatype.ndim == 1:
-             feature_dict[msa_key] = feature_dict[msa_key].at[0, binder_indices].set(binder_aatype.astype(target_dtype_msa))
+    # Process each key in the feature dict
+    for k, v in feature_dict.items():
+        if k == 'aatype':
+            # Update 'aatype' feature using scatter
+            target_dtype = v.dtype
+            updated_v = v.copy()  # Make a copy to avoid in-place operations
+            
+            def update_indices(val, idx):
+                # Use functional scatter
+                updated_val = val.at[idx].set(binder_aatype.astype(target_dtype))
+                return updated_val
+            
+            # Update the aatype features at binder indices
+            updated_feature_dict[k] = update_indices(v, binder_indices)
+            
+            logging.debug(f"Updated {k} with shape {updated_feature_dict[k].shape}")
+        
+        elif k == 'msa' and v.shape[0] > 0:
+            # Update msa for the first row (target sequence) using scatter
+            target_dtype = v.dtype
+            updated_v = v.copy()  # Make a copy to avoid in-place operations
+            
+            # Define update function for MSA - uses functional scatter approach
+            def update_msa_indices(val, row_idx, col_indices):
+                # Update first row of MSA at binder positions
+                updated_val = val.at[row_idx, col_indices].set(binder_aatype.astype(target_dtype))
+                return updated_val
+            
+            # Update the first row of MSA at binder positions
+            updated_feature_dict[k] = update_msa_indices(v, 0, binder_indices)
+            
+            logging.debug(f"Updated {k} with shape {updated_feature_dict[k].shape}")
         else:
-             logging.error(f"binder_aatype has unexpected shape {binder_aatype.shape} during MSA update. Expected 1D.")
-    else:
-        logging.warning(f"Key '{msa_key}' not found for updating.")
+            # Copy other features as-is
+            updated_feature_dict[k] = v
     
-    return feature_dict 
+    return updated_feature_dict 

@@ -131,7 +131,7 @@ class BinderDesigner:
         # Create a dictionary containing only JAX-compatible data
         feature_dict_jax = {k: v for k, v in feature_dict.items() if k not in keys_to_remove}
         # --------------------------------------------------------------------------
-        
+        logging.info(f"Feature_dict_jax keys: {feature_dict_jax.keys()}")
         # Setup logging and trajectory storage
         trajectory = {
             "loss": [],
@@ -194,9 +194,9 @@ class BinderDesigner:
             updates, opt_state = optimizer.update(grads, opt_state, binder_seq_logits)
             binder_seq_logits = optax.apply_updates(binder_seq_logits, updates)
             
-            # Convert to concrete values for logging
-            loss_val = float(loss)
-            losses_val = {k: float(v) for k, v in losses.items()}
+            # Get loss value for logging without trying to convert JAX array to Python float inside JIT context
+            step_loss_val = loss
+            step_losses_val = losses
             
             # Log progress
             step_time = time.time() - step_start_time
@@ -209,20 +209,21 @@ class BinderDesigner:
                 aa_letters = list(string.ascii_uppercase)[:20]  # Simple A-T for 20 amino acids
                 current_seq = ''.join([aa_letters[idx] for idx in aa_indices])
                 
-                logging.info(f"Step {step}/{steps}: loss={loss_val:.4f}, time={step_time:.2f}s")
-                logging.info(f"Losses: {losses_val}")
+                logging.info(f"Step {step}/{steps}: loss={safe_jax_to_float(step_loss_val):.4f}, time={step_time:.2f}s")
+                safe_losses = safe_process_losses(step_losses_val)
+                logging.info(f"Losses: {safe_losses}")
                 
                 trajectory["sequences"].append(current_seq)
             
             # Store in trajectory
-            trajectory["loss"].append(loss_val)
-            trajectory["losses"].append(losses_val)
+            trajectory["loss"].append(step_loss_val)
+            trajectory["losses"].append(step_losses_val)
             trajectory["step"].append(step)
             trajectory["time"].append(step_time)
             
-            # Track best loss
-            if loss_val < best_loss:
-                best_loss = loss_val
+            # Track best loss (comparing JAX arrays)
+            if step_loss_val < best_loss:
+                best_loss = step_loss_val
                 best_logits = binder_seq_logits
                 best_feature_dict = updated_feature_dict
         
@@ -243,7 +244,7 @@ class BinderDesigner:
         }
         
         logging.info(f"Gradient-based binder design completed in {design_results['design_time']:.2f}s")
-        logging.info(f"Best loss: {best_loss:.4f}")
+        logging.info(f"Best loss: {safe_jax_to_float(best_loss):.4f}")
         
         return design_results, best_feature_dict
     
@@ -261,6 +262,19 @@ class BinderDesigner:
         Returns:
             Partial results from the forward pass.
         """
+        logging.info("Starting boltz_forward_pass with feature_dict keys: " + str(list(feature_dict.keys())))
+        
+        # Validate key features are present
+        required_keys = ['aatype', 'seq_mask', 'msa', 'msa_mask']
+        missing_keys = [k for k in required_keys if k not in feature_dict]
+        if missing_keys:
+            logging.error(f"Missing required features for forward pass: {missing_keys}")
+            raise ValueError(f"Missing required features for forward pass: {missing_keys}")
+        
+        # Log shapes of key features
+        logging.info(f"aatype shape: {feature_dict['aatype'].shape}, seq_mask shape: {feature_dict['seq_mask'].shape}")
+        logging.info(f"msa shape: {feature_dict['msa'].shape}, msa_mask shape: {feature_dict['msa_mask'].shape}")
+        
         # Run the standard model inference but with a special mode parameter
         # that indicates this is a boltz design run (will stop_gradient at structure module)
         boltz_result = self.model_runner.run_inference(
@@ -268,6 +282,38 @@ class BinderDesigner:
             rng_key,
             mode="boltz_design"  # Special mode to signal gradient stopping for BoltzDesign1
         )
+        
+        # Validate result structure
+        if not isinstance(boltz_result, dict):
+            logging.error(f"Expected dict result from run_inference, got: {type(boltz_result)}")
+        
+        # Check for essential keys in result
+        result_keys = list(boltz_result.keys())
+        logging.info(f"Boltz forward pass returned keys: {result_keys}")
+        
+        expected_keys = ['distogram', 'confidence_outputs']
+        missing_result_keys = [k for k in expected_keys if k not in result_keys]
+        if missing_result_keys:
+            logging.warning(f"Missing expected keys in boltz_result: {missing_result_keys}")
+        
+        # Check distogram shape if present
+        if 'distogram' in boltz_result:
+            distogram_keys = list(boltz_result['distogram'].keys())
+            logging.info(f"Distogram contains keys: {distogram_keys}")
+            if 'contact_probs' in boltz_result['distogram']:
+                contact_shape = boltz_result['distogram']['contact_probs'].shape
+                logging.info(f"Contact_probs shape: {contact_shape}")
+        
+        # Check confidence outputs if present 
+        if 'confidence_outputs' in boltz_result:
+            confidence_keys = list(boltz_result['confidence_outputs'].keys())
+            logging.info(f"Confidence_outputs contains keys: {confidence_keys}")
+            for key in confidence_keys:
+                try:
+                    shape = boltz_result['confidence_outputs'][key].shape
+                    logging.info(f"  - {key} shape: {shape}")
+                except:
+                    logging.info(f"  - {key} shape: unknown (couldn't determine)")
         
         logging.info("Ran BoltzDesign forward pass successfully using main model with 'boltz_design' mode")
         return boltz_result
@@ -366,31 +412,34 @@ class BinderDesigner:
             # Stage-specific sequence representation
             num_residue_types = curr_binder_logits.shape[-1]
             
-            # Process sequence logits based on stage
-            if stage_idx == 0:  # Stage 1: Exploration (T=1.0)
-                temp = 1.0
-                seq_probs = jax.nn.softmax(curr_binder_logits / temp, axis=-1)
-            elif stage_idx == 1:  # Stage 2: Transition
-                # Use the temp parameter directly
-                # Interpolation between logits and softmax probabilities
+            # --- Process sequence logits using JAX-compatible control flow ---
+            
+            # Stage 1: Exploration (T=1.0)
+            def stage_0_fn(_):
+                return jax.nn.softmax(curr_binder_logits / 1.0, axis=-1)
+                
+            # Stage 2: Transition
+            def stage_1_fn(_):
                 seq_probs_logits = jax.nn.softmax(curr_binder_logits, axis=-1)
                 seq_probs_softmax = jax.nn.softmax(curr_binder_logits / temp, axis=-1)
-                seq_probs = 0.5 * seq_probs_logits + 0.5 * seq_probs_softmax
-            elif stage_idx == 2:  # Stage 3: Convergence (gradually decreasing temperature)
-                # Initial temp for this stage
-                temp = 0.5
-                logging.info(f"Starting stage 3: Convergence with initial temperature {temp}")
-                seq_probs = jax.nn.softmax(curr_binder_logits / temp, axis=-1)
-            elif stage_idx == 3:  # Stage 4: One-hot with straight-through estimator
-                # Use the temp parameter directly
-                # Softmax with very low temperature (approximates one-hot)
+                return 0.5 * seq_probs_logits + 0.5 * seq_probs_softmax
+                
+            # Stage 3: Convergence (gradually decreasing temperature)
+            def stage_2_fn(_):
+                return jax.nn.softmax(curr_binder_logits / temp, axis=-1)
+                
+            # Stage 4: One-hot with straight-through estimator
+            def stage_3_fn(_):
                 seq_probs_soft = jax.nn.softmax(curr_binder_logits / temp, axis=-1)
-                # Get hard one-hot
                 seq_probs_hard = jax.nn.one_hot(jnp.argmax(seq_probs_soft, axis=-1), num_residue_types)
-                # Straight-through estimator (pass gradient through soft probabilities)
-                seq_probs = jax.lax.stop_gradient(seq_probs_hard - seq_probs_soft) + seq_probs_soft
-            else:
-                raise ValueError(f"Invalid stage index: {stage_idx}")
+                return jax.lax.stop_gradient(seq_probs_hard - seq_probs_soft) + seq_probs_soft
+                
+            # Use JAX's switch statement equivalent
+            seq_probs = jax.lax.switch(
+                stage_idx,
+                [stage_0_fn, stage_1_fn, stage_2_fn, stage_3_fn],
+                None
+            )
             
             # Update features based on sequence probabilities - use JAX array binder_indices
             updated_feature_dict = binder_utils.update_features_from_logits(
@@ -411,15 +460,34 @@ class BinderDesigner:
                 curr_binder_logits, design_params_static
             )
             
-            # Apply additional sequence shaping in one-hot stage
-            if stage_idx == 3:  # Final one-hot stage
-                # Add straight-through cross-entropy to encourage convergence to one-hot
+            # Apply additional sequence shaping in one-hot stage using JAX-compatible control flow
+            def apply_stage_3_entropy(args):
+                loss, breakdown = args
+                seq_probs_soft = jax.nn.softmax(curr_binder_logits / temp, axis=-1)
+                seq_probs_hard = jax.nn.one_hot(jnp.argmax(seq_probs_soft, axis=-1), num_residue_types)
                 seq_cross_entropy = -jnp.sum(seq_probs_hard * jax.nn.log_softmax(curr_binder_logits, axis=-1))
                 seq_entropy_weight = design_params_static.get("weights", {}).get("seq_one_hot", 0.1)
-                total_loss += seq_entropy_weight * seq_cross_entropy
-                loss_breakdown["seq_one_hot"] = seq_cross_entropy
+                new_loss = loss + seq_entropy_weight * seq_cross_entropy
+                new_breakdown = dict(breakdown)  # Create a copy to avoid mutation 
+                new_breakdown["seq_one_hot"] = seq_cross_entropy
+                return new_loss, new_breakdown
+                
+            def keep_as_is(args):
+                loss, breakdown = args
+                # Create a new dictionary with the same structure as apply_stage_3_entropy
+                new_breakdown = dict(breakdown)
+                new_breakdown["seq_one_hot"] = jnp.zeros((), dtype=jnp.float32)
+                return loss, new_breakdown
+                
+            # Use JAX's conditional to apply one-hot entropy in stage 3 only
+            total_loss, updated_breakdown = jax.lax.cond(
+                stage_idx == 3,
+                apply_stage_3_entropy,
+                keep_as_is,
+                (total_loss, loss_breakdown)
+            )
             
-            return total_loss, (loss_breakdown, boltz_result, updated_feature_dict)
+            return total_loss, (updated_breakdown, boltz_result, updated_feature_dict)
         
         # Define the gradient function directly on the loss function
         grad_loss_fn = jax.value_and_grad(loss_fn_for_grad_boltz, argnums=0, has_aux=True)
@@ -434,6 +502,7 @@ class BinderDesigner:
         best_logits = None
         best_feature_dict = None
         current_step = 0
+        stage_success = [False, False, False, False]  # Track success for each stage
         
         for stage_idx, stage_steps in enumerate(stages):
             # Configure temperature schedule for each stage
@@ -453,6 +522,8 @@ class BinderDesigner:
                 temp = 0.01
                 logging.info(f"Starting stage 4: One-hot refinement with temperature {temp}")
             
+            stage_had_successful_step = False
+            
             for step in range(stage_steps):
                 step_start_time = time.time()
                 step_key, rng_key = jax.random.split(rng_key)
@@ -465,27 +536,86 @@ class BinderDesigner:
                 
                 # Call the JITted grad_fn with all arguments explicitly
                 # Passing the tuples for static indices arguments and the filtered feature dict
-                (loss, (losses, partial_result, updated_feature_dict)), grads = grad_fn(
-                    binder_seq_logits,          # Arg 0
-                    stage_idx,                  # Arg 1
-                    temp,                       # Arg 2
-                    step_key,                   # Arg 3
-                    # --- Pass the filtered dict as non-static --- 
-                    feature_dict_template_jax,  # Arg 4 
-                    # --- Static arguments --- 
-                    target_indices_static_tuple, # Arg 5 (Pass tuple)
-                    binder_indices_static_tuple, # Arg 6 (Pass tuple)
-                    design_weights_static,      # Arg 7 (Pass weights dict)
-                    self.model_runner           # Arg 8 (Static)
-                )
+                logging.info(f"Stage {stage_idx+1}, Step {step}/{stage_steps}: About to call grad_fn")
                 
-                # Update logits
-                updates, opt_state = optimizer.update(grads, opt_state, binder_seq_logits)
-                binder_seq_logits = optax.apply_updates(binder_seq_logits, updates)
+                # Initialize step results with defaults
+                step_loss_val = float('nan')
+                step_losses_val = {"error": "step_failed"}
+                step_success = False
                 
-                # Convert to concrete values for logging
-                loss_val = float(loss)
-                losses_val = {k: float(v) for k, v in losses.items()}
+                try:
+                    (loss, (losses, partial_result, updated_feature_dict)), grads = grad_fn(
+                        binder_seq_logits,          # Arg 0
+                        stage_idx,                  # Arg 1
+                        temp,                       # Arg 2
+                        step_key,                   # Arg 3
+                        # --- Pass the filtered dict as non-static --- 
+                        feature_dict_template_jax,  # Arg 4 
+                        # --- Static arguments --- 
+                        target_indices_static_tuple, # Arg 5 (Pass tuple)
+                        binder_indices_static_tuple, # Arg 6 (Pass tuple)
+                        design_weights_static,      # Arg 7 (Pass weights dict)
+                        self.model_runner           # Arg 8 (Static)
+                    )
+                    logging.info(f"Stage {stage_idx+1}, Step {step}/{stage_steps}: grad_fn call successful")
+                    
+                    # Check gradients for NaN/Inf
+                    grad_has_nan = jnp.any(jnp.isnan(jax.tree_map(lambda x: jnp.sum(x), grads)))
+                    grad_has_inf = jnp.any(jnp.isinf(jax.tree_map(lambda x: jnp.sum(x), grads)))
+                    logging.info(f"Stage {stage_idx+1}, Step {step}/{stage_steps}: Gradient check - has_nan: {grad_has_nan}, has_inf: {grad_has_inf}")
+                    
+                    # Skip update if gradients contain NaN/Inf
+                    if grad_has_nan or grad_has_inf:
+                        logging.warning(f"Stage {stage_idx+1}, Step {step}/{stage_steps}: Skipping update due to NaN/Inf in gradients")
+                        # Get loss value for logging without trying to convert JAX array to Python float inside JIT context
+                        step_loss_val = loss
+                        step_losses_val = losses
+                        continue
+                    
+                    logging.info(f"Stage {stage_idx+1}, Step {step}/{stage_steps}: About to update optimizer")
+                    # Update logits
+                    updates, opt_state = optimizer.update(grads, opt_state, binder_seq_logits)
+                    logging.info(f"Stage {stage_idx+1}, Step {step}/{stage_steps}: Optimizer update successful")
+                    
+                    # Check updates for NaN/Inf
+                    updates_has_nan = jnp.any(jnp.isnan(jax.tree_map(lambda x: jnp.sum(x), updates)))
+                    updates_has_inf = jnp.any(jnp.isinf(jax.tree_map(lambda x: jnp.sum(x), updates)))
+                    logging.info(f"Stage {stage_idx+1}, Step {step}/{stage_steps}: Updates check - has_nan: {updates_has_nan}, has_inf: {updates_has_inf}")
+                    
+                    # Skip applying updates if they contain NaN/Inf
+                    if updates_has_nan or updates_has_inf:
+                        logging.warning(f"Stage {stage_idx+1}, Step {step}/{stage_steps}: Skipping updates due to NaN/Inf")
+                        # Get loss value for logging without trying to convert JAX array to Python float inside JIT context
+                        step_loss_val = loss
+                        step_losses_val = losses
+                        continue
+                    
+                    logging.info(f"Stage {stage_idx+1}, Step {step}/{stage_steps}: About to apply updates")
+                    binder_seq_logits = optax.apply_updates(binder_seq_logits, updates)
+                    logging.info(f"Stage {stage_idx+1}, Step {step}/{stage_steps}: Applied updates successfully")
+                    
+                    # Check updated logits for NaN/Inf
+                    logits_has_nan = jnp.any(jnp.isnan(binder_seq_logits))
+                    logits_has_inf = jnp.any(jnp.isinf(binder_seq_logits))
+                    logging.info(f"Stage {stage_idx+1}, Step {step}/{stage_steps}: Logits check - has_nan: {logits_has_nan}, has_inf: {logits_has_inf}")
+                    
+                    # Mark this step and stage as successful since we got this far
+                    step_success = True
+                    stage_had_successful_step = True
+                    
+                    # Get loss value for logging without trying to convert JAX array to Python float inside JIT context
+                    step_loss_val = loss
+                    step_losses_val = losses
+                    
+                    # Track best loss (comparing JAX arrays)
+                    if step_loss_val < best_loss:
+                        best_loss = step_loss_val
+                        best_logits = binder_seq_logits
+                        best_feature_dict = updated_feature_dict
+                        logging.info(f"Stage {stage_idx+1}, Step {step}/{stage_steps}: New best loss {safe_jax_to_float(best_loss):.4f}")
+                except Exception as e:
+                    logging.error(f"❌ Error in Stage {stage_idx+1}, Step {step}/{stage_steps}: {e}", exc_info=True)
+                    # Don't immediately re-raise, try to continue with next step
                 
                 # Log progress
                 step_time = time.time() - step_start_time
@@ -498,31 +628,67 @@ class BinderDesigner:
                     aa_letters = list(string.ascii_uppercase)[:20]  # Simple A-T for 20 amino acids
                     current_seq = ''.join([aa_letters[idx] for idx in aa_indices])
                     
-                    logging.info(f"Stage {stage_idx+1}, Step {step}/{stage_steps}: "
-                                f"loss={loss_val:.4f}, time={step_time:.2f}s")
-                    logging.info(f"Losses: {losses_val}")
+                    logging.info(f"Stage {stage_idx+1}, Step {step}/{stage_steps}: loss={safe_jax_to_float(step_loss_val):.4f}, time={step_time:.2f}s")
+                    safe_losses = safe_process_losses(step_losses_val)
+                    logging.info(f"Losses: {safe_losses}")
                     
-                    trajectory["sequences"].append(current_seq)
+                    if step_success:
+                        trajectory["sequences"].append(current_seq)
                 
                 # Store in trajectory
-                trajectory["loss"].append(loss_val)
-                trajectory["losses"].append(losses_val)
-                trajectory["step"].append(current_step)
-                trajectory["time"].append(step_time)
-                trajectory["stage"].append(stage_idx)
-                
-                # Track best loss
-                if loss_val < best_loss:
-                    best_loss = loss_val
-                    best_logits = binder_seq_logits
-                    best_feature_dict = updated_feature_dict
+                if step_success:
+                    trajectory["loss"].append(step_loss_val)
+                    trajectory["losses"].append(step_losses_val)
+                    trajectory["step"].append(current_step)
+                    trajectory["time"].append(step_time)
+                    trajectory["stage"].append(stage_idx)
                 
                 current_step += 1
-        
+            
+            # Update stage success tracker
+            stage_success[stage_idx] = stage_had_successful_step
+            if not stage_had_successful_step:
+                logging.warning(f"Stage {stage_idx+1} had no successful steps")
+
         # Final sequence - in the one-hot stage
         temp = 0.01  # Very low temperature for final output
+        
+        # Verify we have valid results
+        if best_logits is None or best_feature_dict is None:
+            logging.error("❌ Binder design optimization failed: No valid solution found")
+            # Return a minimally valid result with error flag
+            design_results = {
+                "protocol": "binder_boltz",
+                "target_indices": target_indices,
+                "binder_indices": binder_indices,
+                "best_loss": float('inf'),
+                "trajectory": trajectory,
+                "design_time": time.time() - design_start_time,
+                "error": "No valid solution found during optimization",
+                "final_aa_indices": np.zeros_like(binder_indices, dtype=np.int32),
+                "success": False,
+                "stage_success": stage_success
+            }
+            return design_results, feature_dict_template
+            
         final_probs = jax.nn.softmax(best_logits / temp, axis=-1)
         final_aa_indices = jnp.argmax(final_probs, axis=-1)
+        
+        # At the end of the method, before returning results:
+        logging.info("======================================")
+        logging.info("Completing binder design optimization loop")
+        logging.info(f"Processed {current_step} total steps across {len(stages)} stages")
+        logging.info(f"Best loss achieved: {safe_jax_to_float(best_loss):.6f}")
+        logging.info(f"Stage success summary: {stage_success}")
+        logging.info(f"Designed sequence length: {len(final_aa_indices)}")
+        
+        # Get amino acid sequence
+        from alphafold3.data import data_constants
+        residue_constants = data_constants.get_residue_constants()
+        restype_idx_to_letter = residue_constants["restype_idx_to_letter"]
+        final_sequence = ''.join([restype_idx_to_letter[aa] for aa in final_aa_indices])
+        logging.info(f"Designed sequence: {final_sequence}")
+        logging.info("======================================")
         
         # Prepare results
         design_results = {
@@ -532,12 +698,11 @@ class BinderDesigner:
             "best_loss": best_loss,
             "trajectory": trajectory,
             "design_time": time.time() - design_start_time,
-            "final_seq_logits": best_logits,
             "final_aa_indices": final_aa_indices,
+            "final_sequence": final_sequence,
+            "success": any(stage_success),
+            "stage_success": stage_success
         }
-        
-        logging.info(f"BoltzDesign1-like binder design completed in {design_results['design_time']:.2f}s")
-        logging.info(f"Best loss: {best_loss:.4f}")
         
         return design_results, best_feature_dict
     
@@ -559,98 +724,122 @@ class BinderDesigner:
         """
         logging.info("Running final prediction with designed sequence (Simplified Method)...")
         
-        # Get the final amino acid indices from the design results
-        final_aa_indices = design_results["final_aa_indices"]
+        # Check if design was successful
+        if not design_results.get("success", True):  # Default to True for backward compatibility
+            logging.error("Cannot run final prediction: Design process was unsuccessful")
+            # Return empty/placeholder results
+            empty_result = {"error": "Failed design process", "status": "error"}
+            empty_feature_dict = {}
+            return empty_result, empty_feature_dict, fold_input
         
-        # Convert to amino acid sequence using a proper mapping from data_constants
         try:
-            from alphafold3.model import data_constants
-            aa_types = data_constants.protein_restypes
-        except (ImportError, AttributeError):
-            # Fallback to standard alphabet if data_constants is not available
-            aa_types = list("ACDEFGHIKLMNPQRSTVWY")
-        
-        # Map indices to amino acid sequences
-        designed_sequence = ''.join([aa_types[idx] for idx in final_aa_indices])
-        logging.info(f"Designed sequence ({len(designed_sequence)} aa): {designed_sequence[:50]}...")
-        
-        # Create a new fold_input with the designed sequence
-        new_chains = []
-        binder_chains = self.design_params["binder_chains"]
-        
-        # Create a mapping of chain ID to the new designed sequence
-        binder_seq_by_chain = {}
-        binder_start_idx = 0
-        
-        # First, build a mapping of chain ID to sequence length
-        chain_lengths = {}
-        for chain in fold_input.chains:
-            chain_lengths[chain.id] = len(chain)
-        
-        # Build a mapping of binder chain ID to its designed sequence
-        for binder_chain_id in binder_chains:
-            if binder_chain_id in chain_lengths:
-                chain_length = chain_lengths[binder_chain_id]
-                # Extract the portion of the designed sequence for this chain
-                binder_seq_by_chain[binder_chain_id] = designed_sequence[binder_start_idx:binder_start_idx + chain_length]
-                binder_start_idx += chain_length
-        
-        # Create new chains with updated sequences where needed
-        for chain in fold_input.chains:
-            if isinstance(chain, folding_input.ProteinChain) and chain.id in binder_chains:
-                # This is a binder chain - replace the sequence
-                if chain.id in binder_seq_by_chain:
-                    new_sequence = binder_seq_by_chain[chain.id]
-                    # Create a new chain with the designed sequence
-                    new_chain = folding_input.ProteinChain(
-                        id=chain.id,
-                        sequence=new_sequence,
-                        ptms=chain.ptms,  # Keep the original PTMs
-                        # Clear MSA and set templates to empty list to force re-search
-                        unpaired_msa=None, 
-                        paired_msa=None,
-                        templates=[] # Use empty list instead of None
-                    )
-                    new_chains.append(new_chain)
-                    logging.info(f"Replaced binder chain {chain.id} sequence and reset MSAs/templates.")
+            # Get the final amino acid indices from the design results
+            final_aa_indices = design_results["final_aa_indices"]
+            
+            # Convert to amino acid sequence using a proper mapping from data_constants
+            try:
+                from alphafold3.model import data_constants
+                aa_types = data_constants.protein_restypes
+            except (ImportError, AttributeError):
+                # Fallback to standard alphabet if data_constants is not available
+                aa_types = list("ACDEFGHIKLMNPQRSTVWY")
+            
+            # Map indices to amino acid sequences
+            designed_sequence = ''.join([aa_types[idx] for idx in final_aa_indices])
+            logging.info(f"Designed sequence ({len(designed_sequence)} aa): {designed_sequence[:50]}...")
+            
+            # Create a new fold_input with the designed sequence
+            new_chains = []
+            binder_chains = self.design_params["binder_chains"]
+            
+            # Create a mapping of chain ID to the new designed sequence
+            binder_seq_by_chain = {}
+            binder_start_idx = 0
+            
+            # First, build a mapping of chain ID to sequence length
+            chain_lengths = {}
+            for chain in fold_input.chains:
+                chain_lengths[chain.id] = len(chain)
+            
+            # Build a mapping of binder chain ID to its designed sequence
+            for binder_chain_id in binder_chains:
+                if binder_chain_id in chain_lengths:
+                    chain_length = chain_lengths[binder_chain_id]
+                    # Extract the portion of the designed sequence for this chain
+                    binder_seq_by_chain[binder_chain_id] = designed_sequence[binder_start_idx:binder_start_idx + chain_length]
+                    binder_start_idx += chain_length
+            
+            # Create new chains with updated sequences where needed
+            for chain in fold_input.chains:
+                if isinstance(chain, folding_input.ProteinChain) and chain.id in binder_chains:
+                    # This is a binder chain - replace the sequence
+                    if chain.id in binder_seq_by_chain:
+                        new_sequence = binder_seq_by_chain[chain.id]
+                        # Create a new chain with the designed sequence
+                        new_chain = folding_input.ProteinChain(
+                            id=chain.id,
+                            sequence=new_sequence,
+                            ptms=chain.ptms,  # Keep the original PTMs
+                            # Clear MSA and set templates to empty list to force re-search
+                            unpaired_msa=None, 
+                            paired_msa=None,
+                            templates=[] # Use empty list instead of None
+                        )
+                        new_chains.append(new_chain)
+                        logging.info(f"Replaced binder chain {chain.id} sequence and reset MSAs/templates.")
+                    else:
+                        # Something went wrong - use the original chain
+                        logging.warning(f"No designed sequence for binder chain {chain.id}, using original")
+                        new_chains.append(chain)
                 else:
-                    # Something went wrong - use the original chain
-                    logging.warning(f"No designed sequence for binder chain {chain.id}, using original")
+                    # This is a target chain or non-protein chain - keep it unchanged
                     new_chains.append(chain)
-            else:
-                # This is a target chain or non-protein chain - keep it unchanged
-                new_chains.append(chain)
-        
-        # Create a new Input object with the updated chains
-        new_fold_input = folding_input.Input(
-            name=fold_input.name + "_designed",
-            chains=new_chains,
-            rng_seeds=[fold_input.rng_seeds[0]],  # Use only the first seed
-            bonded_atom_pairs=fold_input.bonded_atom_pairs,
-            user_ccd=fold_input.user_ccd
-        )
-        
-        logging.info("Created new input with designed binder sequence (Simplified Method)")
-        
-        # Use the best feature dict from design results and update it
-        final_feature_dict = binder_utils.update_features_from_logits(
-            design_results["best_feature_dict"].copy(),
-            design_results["binder_indices"],
-            design_results["final_seq_logits"]
-        )
-        
-        # Run standard prediction
-        logging.info("Running inference on designed sequence (Simplified Method)...")
-        final_result = self.model_runner.run_inference(final_feature_dict, rng_key)
-        
-        logging.info("Final prediction complete (Simplified Method)")
-        
-        # Add designed sequence to the result metadata
-        if isinstance(final_result, dict) and "metadata" in final_result:
-            final_result["metadata"]["designed_sequence"] = designed_sequence
-            final_result["metadata"]["designed_binder_chains"] = binder_chains
-        
-        return final_result, final_feature_dict, new_fold_input
+            
+            # Create a new Input object with the updated chains
+            new_fold_input = folding_input.Input(
+                name=fold_input.name + "_designed",
+                chains=new_chains,
+                rng_seeds=[fold_input.rng_seeds[0]],  # Use only the first seed
+                bonded_atom_pairs=fold_input.bonded_atom_pairs,
+                user_ccd=fold_input.user_ccd
+            )
+            
+            logging.info("Created new input with designed binder sequence (Simplified Method)")
+            
+            # Use the best feature dict from design results and update it
+            try:
+                final_feature_dict = binder_utils.update_features_from_logits(
+                    design_results.get("best_feature_dict", {}).copy(),
+                    design_results["binder_indices"],
+                    design_results["final_seq_logits"]
+                )
+            except Exception as e:
+                logging.error(f"Error updating features from logits: {e}")
+                # If we fail to update from the design results, try to use the original dictionary
+                if "best_feature_dict" in design_results:
+                    final_feature_dict = design_results["best_feature_dict"].copy()
+                else:
+                    # Last resort, use an empty dict
+                    final_feature_dict = {}
+            
+            # Run standard prediction
+            logging.info("Running inference on designed sequence (Simplified Method)...")
+            final_result = self.model_runner.run_inference(final_feature_dict, rng_key)
+            
+            logging.info("Final prediction complete (Simplified Method)")
+            
+            # Add designed sequence to the result metadata
+            if isinstance(final_result, dict) and "metadata" in final_result:
+                final_result["metadata"]["designed_sequence"] = designed_sequence
+            
+            return final_result, final_feature_dict, new_fold_input
+            
+        except Exception as e:
+            logging.error(f"Error in final prediction: {e}", exc_info=True)
+            # Return empty/placeholder results
+            empty_result = {"error": str(e), "status": "error"}
+            empty_feature_dict = {}
+            return empty_result, empty_feature_dict, fold_input
 
     def run_complete_prediction(
         self,
@@ -796,6 +985,7 @@ class BinderDesigner:
             return final_result_simple, final_feature_dict_simple, new_fold_input_simple
 
 
+
 def design_binder(
     fold_input: folding_input.Input,
     feature_dict: features.BatchDict,
@@ -859,3 +1049,20 @@ def design_binder(
         )
     
     return design_results, final_model_result, final_feature_dict, new_fold_input 
+
+def safe_jax_to_float(x):
+    """Safely convert JAX array to float for logging, handling potential errors."""
+    try:
+        if hasattr(x, "item"):
+            return float(x.item())
+        return float(x)
+    except Exception:
+        return float('nan')
+
+def safe_process_losses(losses):
+    """Process dictionary of JAX losses to Python values for logging."""
+    if not isinstance(losses, dict):
+        return {"loss": safe_jax_to_float(losses)}
+    
+    return {k: safe_jax_to_float(v) if hasattr(v, "item") or not isinstance(v, dict) 
+            else safe_process_losses(v) for k, v in losses.items()} 

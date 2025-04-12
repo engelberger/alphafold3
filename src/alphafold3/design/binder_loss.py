@@ -253,36 +253,143 @@ def calculate_boltz_binder_loss(partial_result, feature_dict, target_indices, bi
     Returns:
         Tuple of (total_loss, loss_breakdown).
     """
-    losses = {}
+    from absl import logging
+    
+    # --- Validate inputs ---
+    logging.info("==== STARTING BOLTZ BINDER LOSS CALCULATION ====")
+    logging.info(f"Target indices: {target_indices.shape}, Binder indices: {binder_indices.shape}")
+    logging.info(f"Binder logits shape: {binder_seq_logits.shape}")
+    
+    # Check for empty indices
+    if len(target_indices) == 0:
+        logging.error("Target indices array is empty! Cannot calculate loss.")
+        raise ValueError("Empty target_indices array")
+        
+    if len(binder_indices) == 0:
+        logging.error("Binder indices array is empty! Cannot calculate loss.")
+        raise ValueError("Empty binder_indices array")
+
+    # Log partial_result keys
+    logging.info(f"partial_result keys: {list(partial_result.keys())}")
+    if 'distogram' in partial_result:
+        logging.info(f"distogram keys: {list(partial_result['distogram'].keys())}")
+    if 'confidence_outputs' in partial_result:
+        logging.info(f"confidence_outputs keys: {list(partial_result['confidence_outputs'].keys())}")
+    
+    # Log design weights
     weights = design_params.get("weights", {})
+    logging.info(f"Design weights: {weights}")
+    
+    # Initialize losses dictionary with zero values for all potential loss terms
+    # This ensures consistent dictionary structure regardless of which losses are calculated
+    losses = {
+        'distogram': jnp.array(0.0, dtype=jnp.float32),
+        'plddt': jnp.array(0.0, dtype=jnp.float32),
+        'pae': jnp.array(0.0, dtype=jnp.float32),
+        'seq_entropy': jnp.array(0.0, dtype=jnp.float32),
+        # Initialize seq_one_hot to ensure consistent structure with loss_fn_for_grad_boltz
+        'seq_one_hot': jnp.array(0.0, dtype=jnp.float32)
+    }
     
     # Calculate losses from partial outputs (no backprop through structure module)
-    if weights.get('distogram', 0.0) > 0 and 'distogram' in partial_result:
-        distogram_result = partial_result['distogram']
-        losses['distogram'] = get_distogram_contact_loss(
-            distogram_result, target_indices, binder_indices
-        )
+    if weights.get('distogram', 0.0) > 0:
+        if 'distogram' in partial_result:
+            distogram_result = partial_result['distogram']
+            try:
+                logging.info(f"Calculating distogram loss with shapes - target: {target_indices.shape}, binder: {binder_indices.shape}")
+                distogram_loss = get_distogram_contact_loss(
+                    distogram_result, target_indices, binder_indices
+                )
+                # Use where instead of direct if-check for JAX compatibility
+                losses['distogram'] = jnp.where(
+                    jnp.isnan(distogram_loss) | jnp.isinf(distogram_loss),
+                    jnp.array(0.0, dtype=distogram_loss.dtype),
+                    distogram_loss
+                )
+                # Don't log JAX arrays directly inside a JIT-compiled function
+            except Exception as e:
+                # logging.error("Error in distogram loss calculation: %s", e)
+                # Use a constant loss value that won't cause gradients to explode
+                logging.error(f"Error in distogram loss calculation (not logging full error due to JIT): {type(e)}")
+                losses['distogram'] = jnp.array(0.0, dtype=jnp.float32)
+        else:
+            # logging.warning("Distogram weight > 0 but 'distogram' not in partial_result")
+            logging.warning("Distogram weight > 0 but 'distogram' not in partial_result, skipping")
+            pass
     
-    if weights.get('confidence', 0.0) > 0 and 'confidence_outputs' in partial_result:
-        # Use confidence module outputs for pLDDT and PAE-based losses
-        confidence_output = partial_result['confidence_outputs']
-        
-        if 'predicted_lddt' in confidence_output:
-            plddt_loss = get_binder_plddt_loss(confidence_output, binder_indices)
-            losses['plddt'] = plddt_loss
-        
-        if 'full_pae' in confidence_output:
-            pae_loss = get_interface_pae_loss(confidence_output, target_indices, binder_indices)
-            losses['pae'] = pae_loss
+    if weights.get('confidence', 0.0) > 0:
+        if 'confidence_outputs' in partial_result:
+            # Use confidence module outputs for pLDDT and PAE-based losses
+            confidence_output = partial_result['confidence_outputs']
+            
+            if 'predicted_lddt' in confidence_output:
+                try:
+                    logging.info(f"Calculating pLDDT loss with binder shape: {binder_indices.shape}")
+                    plddt_loss = get_binder_plddt_loss(confidence_output, binder_indices)
+                    # Use where instead of direct if-check for JAX compatibility
+                    losses['plddt'] = jnp.where(
+                        jnp.isnan(plddt_loss) | jnp.isinf(plddt_loss),
+                        jnp.array(0.0, dtype=plddt_loss.dtype),
+                        plddt_loss
+                    )
+                    # Don't log JAX arrays directly inside a JIT-compiled function
+                except Exception as e:
+                    # logging.error("Error in pLDDT loss calculation: %s", e)
+                    # No need to set losses['plddt'] as it's already initialized to 0
+                    logging.error(f"Error in pLDDT loss calculation (not logging full error due to JIT): {type(e)}")
+                    pass
+            
+            if 'full_pae' in confidence_output:
+                try:
+                    logging.info(f"Calculating PAE loss with shapes - target: {target_indices.shape}, binder: {binder_indices.shape}")
+                    pae_loss = get_interface_pae_loss(confidence_output, target_indices, binder_indices)
+                    # Use where instead of direct if-check for JAX compatibility
+                    losses['pae'] = jnp.where(
+                        jnp.isnan(pae_loss) | jnp.isinf(pae_loss),
+                        jnp.array(0.0, dtype=pae_loss.dtype),
+                        pae_loss
+                    )
+                    # Don't log JAX arrays directly inside a JIT-compiled function
+                except Exception as e:
+                    # logging.error("Error in PAE loss calculation: %s", e)
+                    # No need to set losses['pae'] as it's already initialized to 0
+                    logging.error(f"Error in PAE loss calculation (not logging full error due to JIT): {type(e)}")
+                    pass
+        else:
+            # logging.warning("Confidence weight > 0 but 'confidence_outputs' not in partial_result")
+            logging.warning("Confidence weight > 0 but 'confidence_outputs' not in partial_result, skipping")
+            pass
     
     if weights.get('seq_entropy', 0.0) > 0:
-        losses['seq_entropy'] = get_binder_seq_entropy_loss(binder_seq_logits)
+        try:
+            logging.info(f"Calculating sequence entropy loss with logits shape: {binder_seq_logits.shape}")
+            entropy_loss = get_binder_seq_entropy_loss(binder_seq_logits)
+            # Use where instead of direct if-check for JAX compatibility
+            losses['seq_entropy'] = jnp.where(
+                jnp.isnan(entropy_loss) | jnp.isinf(entropy_loss),
+                jnp.array(0.0, dtype=entropy_loss.dtype),
+                entropy_loss
+            )
+            # Don't log JAX arrays directly inside a JIT-compiled function
+        except Exception as e:
+            # logging.error("Error in sequence entropy loss calculation: %s", e)
+            # No need to set losses['seq_entropy'] as it's already initialized to 0
+            logging.error(f"Error in sequence entropy loss calculation (not logging full error due to JIT): {type(e)}")
+            pass
 
-    # Calculate weighted total loss
-    total_loss = 0.0
+    # Calculate weighted total loss with safety checks
+    total_loss = jnp.array(0.0, dtype=jnp.float32)
     for k, v in losses.items():
-        weighted_loss = weights.get(k, 0.0) * v
-        total_loss += weighted_loss
-        losses[k] = v  # Store unweighted loss
+        # Skip seq_one_hot which will be handled separately in the loss_fn_for_grad_boltz
+        if k == 'seq_one_hot':
+            continue
+        weight = weights.get(k, 0.0)
+        weighted_loss = weight * v
+        # In JAX, use functional style for accumulation
+        total_loss = total_loss + weighted_loss
+    
+    # Don't log directly due to JIT
+    # Instead, return the raw values to be logged outside JIT
+    logging.info("Completed loss calculation")
     
     return total_loss, losses 

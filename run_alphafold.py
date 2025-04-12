@@ -371,6 +371,12 @@ except (AttributeError, NameError):
 
 flags.DEFINE_enum('mask_token', 'X', _VALID_MASK_TOKENS,
                   'Amino acid character to use for masking MSA positions.')
+
+
+# set TF_FORCE_UNIFIED_MEMORY=true and XLA_PYTHON_CLIENT_MEM_FRACTION=3.2
+#os.environ["TF_FORCE_UNIFIED_MEMORY"] = "true"
+#os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "3.2"
+
 # ----------------------------------
 
 FLAGS = flags.FLAGS # Define FLAGS after all flags are defined
