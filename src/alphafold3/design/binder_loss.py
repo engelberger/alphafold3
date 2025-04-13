@@ -3,379 +3,596 @@ import jax.numpy as jnp
 import numpy as np
 from absl import logging
 
+# Assume these loss calculation helper functions are correct as provided earlier
+# If they also contain Python `if` statements dependent on JAX tracers,
+# they might need similar refactoring using jax.lax.cond or other JAX primitives.
+
 def get_binder_plddt_loss(result, binder_indices):
-    """Calculate loss based on pLDDT values for binder residues.
-    
+    """Calculate loss based on pLDDT values for binder residues. (Simplified Shape Handling)
+
     Args:
         result: AlphaFold model result dictionary or confidence head output.
         binder_indices: Indices of the binder residues.
-        
+
     Returns:
         Negative average pLDDT (to minimize as a loss function).
     """
     # Handle different output formats
+    plddt = None
     if isinstance(result, dict) and 'predicted_lddt' in result:
         plddt = result['predicted_lddt']
     else:
         logging.warning("Could not find predicted_lddt in result. Format may be incorrect.")
-        return 0.0
-    
-    # plddt shape is likely (num_samples, num_residues_padded, num_atoms)
-    if len(plddt.shape) != 3:
-        logging.error(f"Unexpected pLDDT shape: {plddt.shape}. Expected 3 dimensions (samples, residues, atoms?).")
-        # Attempt to proceed assuming shape is (residues, atoms) or just (residues)
-        if len(plddt.shape) == 2:
-            binder_plddt = plddt[binder_indices, :]
-            binder_plddt_mean = jnp.mean(binder_plddt, axis=-1)
-        elif len(plddt.shape) == 1:
-            binder_plddt_mean = plddt[binder_indices]
-        else:
-            return 0.0 # Cannot handle other shapes
-    else:
+        # Return a JAX array to maintain type consistency for JAX transformations
+        return jnp.array(0.0, dtype=jnp.float32)
+
+    # Ensure plddt is a JAX array for consistent operations
+    plddt = jnp.asarray(plddt)
+    binder_indices = jnp.asarray(binder_indices) # Ensure indices are JAX array
+
+    # --- Simplified Shape Handling: Assume Rank 3 (samples, residues, atoms) ---
+    # If plddt might sometimes be rank 2 (residues, atoms), add a check or handle appropriately.
+    # For now, proceed assuming rank 3 based on original logic.
+    try:
         # Correct indexing: axis 1 for residues
-        # binder_indices should be valid for the padded dimension if features were padded
-        binder_plddt_samples_atoms = plddt[:, binder_indices, :]
-        
-        # Average over atoms (axis 2) and samples (axis 0)
-        binder_plddt_mean = jnp.mean(binder_plddt_samples_atoms, axis=(0, 2))
-    
+        # binder_indices should be valid for the padded dimension
+        binder_plddt_samples_atoms = plddt[:, binder_indices, :] # Assumes rank 3
+
+        # Average over atoms (last axis, -1) and samples (first axis, 0)
+        binder_plddt_mean_per_residue = jnp.mean(binder_plddt_samples_atoms, axis=(0, -1))
+
+    except IndexError as e:
+         # This might occur if plddt has fewer than 3 dimensions
+         logging.error(f"Error indexing pLDDT (shape={plddt.shape}) assuming rank 3: {e}. Returning 0 loss.")
+         return jnp.array(0.0, dtype=jnp.float32)
+    except Exception as e:
+         # Catch other potential errors during calculation
+         logging.error(f"Error calculating binder pLDDT mean (shape={plddt.shape}): {e}. Returning 0 loss.")
+         return jnp.array(0.0, dtype=jnp.float32)
+    # --- End Simplified Shape Handling ---
+
     # Return negative average pLDDT (as we want to maximize pLDDT)
     # Ensure the result is scalar
-    return -jnp.mean(binder_plddt_mean)
+    # Use nan_to_num for safety before final mean, although mean usually handles NaNs
+    return -jnp.mean(jnp.nan_to_num(binder_plddt_mean_per_residue))
 
 def get_interface_pae_loss(result, target_indices, binder_indices):
     """Calculate loss based on PAE values at the interface.
-    
+
     Args:
         result: AlphaFold model result dictionary or confidence head output.
         target_indices: Indices of the target residues.
         binder_indices: Indices of the binder residues.
-        
+
     Returns:
         Average PAE at the interface (target-binder interactions).
     """
     # Handle different output formats
+    pae = None
     if isinstance(result, dict):
         # Check various possible PAE keys
-        for pae_key in ['full_pae', 'pae']:
+        for pae_key in ['full_pae', 'pae']:  # Prioritize 'full_pae' if available
             if pae_key in result:
                 pae = result[pae_key]
                 break
         else:
             logging.warning("Could not find PAE data in result. Format may be incorrect.")
-            return 0.0
+            return jnp.array(0.0, dtype=jnp.float32)  # Return JAX array
     else:
         logging.warning("Result is not a dictionary. Cannot extract PAE.")
-        return 0.0
-    
-    # Some models may have batched PAE matrices
-    if len(pae.shape) > 2:
-        # Average across batches if there are multiple samples
-        pae = jnp.mean(pae, axis=0)
-    
-    # Extract interface PAE (target to binder interactions)
-    interface_pae = pae[target_indices][:, binder_indices]
-    
-    # Return average PAE at the interface (lower is better)
-    return jnp.mean(interface_pae)
+        return jnp.array(0.0, dtype=jnp.float32)  # Return JAX array
+
+    pae = jnp.asarray(pae)  # Ensure it's a JAX array
+    jax.debug.print(">>> get_interface_pae_loss: Input pae shape={s}, rank={r}", 
+                    s=pae.shape, r=pae.ndim)
+
+    # --- JAX-friendly shape handling for potential batch dimension ---
+    pae_rank = pae.ndim
+
+    def process_pae_rank_gt_2(arr):
+        # Average over the first (batch/sample) dimension
+        processed_arr = jnp.mean(arr, axis=0)  # Output shape is (R, R)
+        jax.debug.print(">>> process_pae_rank_gt_2: Input shape={s}, Output shape={o}",
+                        s=arr.shape, o=processed_arr.shape)
+        return processed_arr
+
+    def process_pae_rank_le_2(arr):
+        # For rank <= 2, unify shape to (R, R) by ignoring any leading dimension of size 1
+        jax.debug.print(">>> process_pae_rank_le_2: Input arr shape={s}, rank={r}", 
+                        s=arr.shape, r=arr.ndim)
+        # Reshape to the final two dimensions (R, R)
+        processed_le_2 = jnp.reshape(arr, arr.shape[-2:])
+        jax.debug.print(">>> process_pae_rank_le_2: Output shape={s}", 
+                        s=processed_le_2.shape)
+        return processed_le_2
+
+    # Use a cond to handle whether there's a batch dimension
+    pae_processed = jax.lax.cond(
+        jnp.greater(pae_rank, 2),  # If rank > 2, assume shape (S, R, R)
+        process_pae_rank_gt_2,     # -> reduce over first dim to get (R, R)
+        process_pae_rank_le_2,     # -> either identity if it's (R, R) or squeeze if (1, R, R)
+        pae
+    )
+    jax.debug.print(">>> get_interface_pae_loss: pae_processed shape={s}", 
+                    s=pae_processed.shape)
+    # Now pae_processed should always be (R, R).
+
+    # Ensure indices are JAX arrays
+    target_indices_jax = jnp.asarray(target_indices)
+    binder_indices_jax = jnp.asarray(binder_indices)
+
+    # --- JAX-friendly check for 2D shape before indexing ---
+    def index_pae_2d(arr_2d):
+        jax.debug.print(">>> index_pae_2d: Input shape={s}", s=arr_2d.shape)
+        interface_pae = arr_2d[jnp.ix_(target_indices_jax, binder_indices_jax)]
+        # Use nan_to_num before mean for safety
+        return jnp.mean(jnp.nan_to_num(interface_pae))
+
+    def handle_non_2d_pae(arr_non_2d):
+        jax.debug.print(">>> handle_non_2d_pae: Input shape={s}", s=arr_non_2d.shape)
+        return jnp.array(0.0, dtype=jnp.float32)
+
+    pae_loss = jax.lax.cond(
+        jnp.equal(pae_processed.ndim, 2),
+        index_pae_2d,
+        handle_non_2d_pae,
+        pae_processed
+    )
+    jax.debug.print(">>> get_interface_pae_loss: Final pae_loss={p}", p=pae_loss)
+
+    return pae_loss
+
+
+
 
 def get_contact_loss(result, target_indices, binder_indices):
     """Calculate loss based on contact probability.
-    
+
     Args:
         result: AlphaFold model result or distogram result.
         target_indices: Indices of the target residues.
         binder_indices: Indices of the binder residues.
-        
+
     Returns:
         Negative average contact probability at the interface.
     """
     # Check if this is from full model or just distogram output
-    if 'contact_probs' in result:
-        contact_probs = result['contact_probs']
-    else:
-        # For full model result
-        contact_probs = result.get('distogram', {}).get('contact_probs', None)
-        
+    contact_probs = None
+    if isinstance(result, dict):
+        if 'contact_probs' in result:
+             # Assuming direct output like from distogram head
+            contact_probs = result['contact_probs']
+        elif 'distogram' in result and isinstance(result['distogram'], dict) and 'contact_probs' in result['distogram']:
+             # Check within nested distogram dict
+            contact_probs = result['distogram']['contact_probs']
+
     if contact_probs is None:
         logging.warning("Contact probabilities not found in result dictionary")
-        return 0.0
-    
-    # Extract interface contacts (target to binder interactions)
-    interface_contacts = contact_probs[target_indices][:, binder_indices]
-    
-    # Return negative average contact probability (as we want to maximize contacts)
-    return -jnp.mean(interface_contacts)
+        return jnp.array(0.0, dtype=jnp.float32) # Return JAX array
+
+    contact_probs = jnp.asarray(contact_probs) # Ensure JAX array
+
+    # Extract interface contacts using JAX indexing
+    target_indices_jax = jnp.asarray(target_indices)
+    binder_indices_jax = jnp.asarray(binder_indices)
+
+    # --- JAX-friendly check for 2D shape before indexing ---
+    def index_contacts_2d(arr_2d):
+        interface_contacts = arr_2d[jnp.ix_(target_indices_jax, binder_indices_jax)]
+        # Use nan_to_num before mean for safety
+        return -jnp.mean(jnp.nan_to_num(interface_contacts)) # Return negative mean
+
+    def handle_non_2d_contacts(arr_non_2d):
+        # jax.debug.print("Contact probs shape is not 2D: {}", arr_non_2d.shape) # Use if needed
+        return jnp.array(0.0, dtype=jnp.float32) # Return 0 loss
+
+    contact_loss = jax.lax.cond(
+        jnp.equal(contact_probs.ndim, 2), # Check if contact_probs is 2D
+        index_contacts_2d,
+        handle_non_2d_contacts,
+        contact_probs # Operand is the contact_probs matrix
+    )
+    # --- End JAX-friendly check ---
+
+    return contact_loss
+
 
 def get_target_fape_loss(result, initial_coords, target_indices):
-    """Calculate loss to maintain target structure.
-    
+    """Calculate loss to maintain target structure using FAPE-like RMSD.
+
     Args:
         result: AlphaFold model result dictionary.
-        initial_coords: Initial coordinates of the structure.
-        target_indices: Indices of the target residues.
-        
+        initial_coords: Initial coordinates of the structure (NumPy or JAX array).
+        target_indices: Indices of the target residues (NumPy or JAX array).
+
     Returns:
-        FAPE loss for target residues.
+        FAPE-like loss for target residues.
     """
-    # Get final coordinates
-    final_coords = result['final_atom_positions']
-    
-    # Calculate RMSD between initial and final coordinates for target
-    target_initial_coords = initial_coords[target_indices]
-    target_final_coords = final_coords[target_indices]
-    
-    # Create mask for valid atoms
-    valid_mask = jnp.any(target_initial_coords != 0, axis=-1)
-    
-    # Calculate squared distances
-    squared_diff = jnp.sum(
-        jnp.square(target_final_coords - target_initial_coords) * valid_mask[..., None],
-        axis=-1
-    )
-    
-    # Return average RMSD for valid atoms
-    return jnp.sum(squared_diff) / (jnp.sum(valid_mask) + 1e-8)
+    # Get final coordinates from result
+    if 'final_atom_positions' not in result:
+        logging.warning("final_atom_positions not found in result for FAPE calculation.")
+        return jnp.array(0.0, dtype=jnp.float32)
+
+    final_coords = jnp.asarray(result['final_atom_positions'])
+    initial_coords = jnp.asarray(initial_coords) # Ensure JAX array
+    target_indices = jnp.asarray(target_indices) # Ensure JAX array
+
+    # Add checks for compatible shapes before indexing - These Python checks might fail under JIT/grad
+    # It's safer to perform shape checks outside the JITted function or handle potential errors inside.
+    # For now, assume shapes are compatible based on typical usage.
+
+    try:
+        # Select coordinates for target residues
+        # Assuming coordinates shape is (..., num_residues_padded, num_atoms, 3)
+        target_initial_coords = initial_coords[..., target_indices, :, :]
+        target_final_coords = final_coords[..., target_indices, :, :]
+
+        # Create mask for valid atoms (non-zero coordinates)
+        valid_mask_initial = jnp.any(target_initial_coords != 0, axis=-1)
+        valid_mask_final = jnp.any(target_final_coords != 0, axis=-1)
+        valid_mask = valid_mask_initial & valid_mask_final
+
+        # Calculate squared distances, applying the mask
+        squared_diff = jnp.sum(
+            jnp.square(target_final_coords - target_initial_coords) * valid_mask[..., None],
+            axis=-1 # Sum over xyz coordinates
+        )
+
+        # Calculate mean squared error, considering only valid atoms
+        sum_sq_diff = jnp.sum(squared_diff)
+        num_valid_atoms = jnp.sum(valid_mask)
+        safe_denom = jnp.maximum(num_valid_atoms, 1e-8)
+        safe_rmsd_like_loss = sum_sq_diff / safe_denom
+
+        # Use nan_to_num for final safety
+        return jnp.nan_to_num(safe_rmsd_like_loss)
+
+    except Exception as e:
+        # Catch potential shape or indexing errors during JAX operations
+        logging.error(f"Error during FAPE calculation (shapes final:{final_coords.shape}, initial:{initial_coords.shape}, indices:{target_indices.shape}): {e}")
+        return jnp.array(0.0, dtype=jnp.float32)
+
 
 def get_binder_seq_entropy_loss(binder_seq_logits):
     """Calculate sequence entropy loss to encourage diversity.
-    
+
     Args:
-        binder_seq_logits: Sequence logits for the binder.
-        
+        binder_seq_logits: Sequence logits for the binder (JAX array).
+
     Returns:
-        Negative sequence entropy.
+        Negative mean sequence entropy (scalar JAX array).
     """
+    # Ensure input is JAX array
+    binder_seq_logits = jnp.asarray(binder_seq_logits)
+
     probs = jax.nn.softmax(binder_seq_logits, axis=-1)
-    log_probs = jnp.log(probs + 1e-8)
-    entropy = -jnp.sum(probs * log_probs, axis=-1)
-    
-    # Return negative entropy (as we want to maximize entropy for diversity)
-    return -jnp.mean(entropy)
+    # Add epsilon for numerical stability before log
+    log_probs = jnp.log(jnp.maximum(probs, 1e-8)) # Use maximum instead of add
+    entropy = -jnp.sum(probs * log_probs, axis=-1) # Entropy per position
+
+    # Return negative mean entropy (as we want to maximize entropy for diversity)
+    # Use nan_to_num for safety before final mean
+    return -jnp.mean(jnp.nan_to_num(entropy))
+
 
 def get_distogram_contact_loss(distogram_result, target_indices, binder_indices):
     """Calculate loss based on distogram contacts.
-    
+
     Args:
         distogram_result: Distogram head output dictionary.
         target_indices: Indices of the target residues.
         binder_indices: Indices of the binder residues.
-        
+
     Returns:
         Negative average contact probability at the interface.
     """
-    # Extract the contact probabilities at the specified cutoff
-    # In AlphaFold3, the distogram output already provides 'contact_probs'
-    if 'contact_probs' in distogram_result:
+    contact_probs = None
+    # Extract the contact probabilities
+    if isinstance(distogram_result, dict) and 'contact_probs' in distogram_result:
         contact_probs = distogram_result['contact_probs']
     else:
-        # If direct contact probabilities aren't available, compute them from the distogram
-        logging.warning("Direct contact_probs not found in distogram output, using fallback method")
-        bin_edges = distogram_result.get('bin_edges', None)
-        if bin_edges is None:
-            logging.error("Cannot compute contact probabilities: bin_edges not found in distogram output")
-            return 0.0
-            
-        # Get the distogram probabilities
-        distogram_probs = distogram_result.get('probs', distogram_result.get('logits', None))
-        if distogram_probs is None:
-            logging.error("Cannot compute contact probabilities: no probability or logit data found")
-            return 0.0
-            
-        # Find which bins correspond to distances < 8Å
-        contact_threshold = 8.0  # standard contact threshold
-        contact_bins = (bin_edges < contact_threshold).sum()
-        
-        # Sum probabilities for bins that correspond to contact
-        contact_probs = jnp.sum(distogram_probs[..., :contact_bins], axis=-1)
-    
-    # Extract interface contacts (target to binder interactions)
-    interface_contacts = contact_probs[target_indices][:, binder_indices]
-    
-    # Return negative average contact probability (as we want to maximize contacts)
-    return -jnp.mean(interface_contacts)
+        # Fallback or error if contact_probs are not directly available
+        logging.warning("Direct 'contact_probs' not found in distogram output. Fallback not implemented in JAX-refactored version.")
+        return jnp.array(0.0, dtype=jnp.float32) # Return JAX array
+
+    if contact_probs is None:
+         logging.warning("Contact probabilities calculation failed or key missing.")
+         return jnp.array(0.0, dtype=jnp.float32)
+
+    contact_probs = jnp.asarray(contact_probs) # Ensure JAX array
+
+    # Extract interface contacts using JAX indexing
+    target_indices_jax = jnp.asarray(target_indices)
+    binder_indices_jax = jnp.asarray(binder_indices)
+
+    # --- JAX-friendly check for 2D shape before indexing ---
+    def index_contacts_2d(arr_2d):
+        interface_contacts = arr_2d[jnp.ix_(target_indices_jax, binder_indices_jax)]
+        # Use nan_to_num before mean for safety
+        return -jnp.mean(jnp.nan_to_num(interface_contacts)) # Return negative mean
+
+    def handle_non_2d_contacts(arr_non_2d):
+        # jax.debug.print("Contact probs shape is not 2D: {}", arr_non_2d.shape) # Use if needed
+        return jnp.array(0.0, dtype=jnp.float32) # Return 0 loss
+
+    contact_loss = jax.lax.cond(
+        jnp.equal(contact_probs.ndim, 2), # Check if contact_probs is 2D
+        index_contacts_2d,
+        handle_non_2d_contacts,
+        contact_probs # Operand is the contact_probs matrix
+    )
+    # --- End JAX-friendly check ---
+
+    return contact_loss
+
 
 def calculate_gradient_binder_loss(result, feature_dict, target_indices, binder_indices, binder_seq_logits, design_params):
-    """Calculate loss for gradient-based binder design.
-    
+    """Calculate loss for gradient-based binder design. (Refactored for JAX control flow)
+
     Args:
         result: AlphaFold model result dictionary.
         feature_dict: Feature dictionary.
         target_indices: Indices of the target residues.
         binder_indices: Indices of the binder residues.
         binder_seq_logits: Sequence logits for the binder.
-        design_params: Dictionary of design parameters.
-        
+        design_params: Dictionary of design parameters (containing weights).
+
     Returns:
         Tuple of (total_loss, loss_breakdown).
     """
     losses = {}
-    weights = design_params.get("weights", {})
-    
-    # Calculate losses
-    if weights.get('plddt', 0.0) > 0:
-        losses['plddt'] = get_binder_plddt_loss(result, binder_indices)
-    
-    if weights.get('pae_inter', 0.0) > 0:
-        losses['pae_inter'] = get_interface_pae_loss(result, target_indices, binder_indices)
-    
-    if weights.get('contact', 0.0) > 0:
-        losses['contact'] = get_contact_loss(result, target_indices, binder_indices)
-    
-    if weights.get('seq_entropy', 0.0) > 0:
-        losses['seq_entropy'] = get_binder_seq_entropy_loss(binder_seq_logits)
-    
-    if weights.get('fape_target', 0.0) > 0 and 'initial_coords' in feature_dict:
-        losses['fape_target'] = get_target_fape_loss(
-            result, feature_dict['initial_coords'], target_indices
-        )
+    weights = design_params.get("weights", {}) # Get weights dict
+    zero_loss_float32 = jnp.array(0.0, dtype=jnp.float32)
+
+    # Ensure indices are JAX arrays
+    target_indices_jax = jnp.asarray(target_indices)
+    binder_indices_jax = jnp.asarray(binder_indices)
+
+    # --- Calculate pLDDT Loss ---
+    plddt_weight = weights.get('plddt', 0.0)
+    losses['plddt'] = jax.lax.cond(
+        jnp.greater(jnp.asarray(plddt_weight), 0.0),
+        lambda op: get_binder_plddt_loss(op[0], op[1]), # Use lambda with operand tuple
+        lambda op: zero_loss_float32,
+        (result, binder_indices_jax) # Pass operands as tuple
+    )
+
+    # --- Calculate Interface PAE Loss ---
+    pae_inter_weight = weights.get('pae_inter', 0.0)
+    losses['pae_inter'] = jax.lax.cond(
+        jnp.greater(jnp.asarray(pae_inter_weight), 0.0),
+        lambda op: get_interface_pae_loss(op[0], op[1], op[2]),
+        lambda op: zero_loss_float32,
+        (result, target_indices_jax, binder_indices_jax) # Pass operands as tuple
+    )
+
+    # --- Calculate Contact Loss ---
+    contact_weight = weights.get('contact', 0.0)
+    losses['contact'] = jax.lax.cond(
+        jnp.greater(jnp.asarray(contact_weight), 0.0),
+        lambda op: get_contact_loss(op[0], op[1], op[2]),
+        lambda op: zero_loss_float32,
+        (result, target_indices_jax, binder_indices_jax) # Pass operands as tuple
+    )
+
+    # --- Calculate Sequence Entropy Loss ---
+    seq_entropy_weight = weights.get('seq_entropy', 0.0)
+    losses['seq_entropy'] = jax.lax.cond(
+        jnp.greater(jnp.asarray(seq_entropy_weight), 0.0),
+        lambda logits: get_binder_seq_entropy_loss(logits),
+        lambda logits: zero_loss_float32,
+        binder_seq_logits # Operand
+    )
+
+    # --- Calculate Target FAPE Loss ---
+    fape_target_weight = weights.get('fape_target', 0.0)
+    # This condition also depends on feature_dict key presence, handled inside the 'true' function
+    def calc_fape_true(operand):
+        res, feat_dict, tgt_idx = operand
+        # Python dictionary key check is okay here before JAX ops
+        if 'initial_coords' in feat_dict:
+             return get_target_fape_loss(res, feat_dict['initial_coords'], tgt_idx)
+        else:
+             # Avoid logging inside cond branches if possible
+             # logging.warning("FAPE target weight > 0 but 'initial_coords' not in feature_dict.")
+             return zero_loss_float32
+    def calc_fape_false(_):
+        return zero_loss_float32
+
+    losses['fape_target'] = jax.lax.cond(
+        jnp.greater(jnp.asarray(fape_target_weight), 0.0),
+        calc_fape_true,
+        calc_fape_false,
+        (result, feature_dict, target_indices_jax) # Pass tuple of operands
+    )
 
     # Calculate weighted total loss
-    total_loss = 0.0
-    for k, v in losses.items():
-        weighted_loss = weights.get(k, 0.0) * v
-        total_loss += weighted_loss
-        losses[k] = v  # Store unweighted loss
-    
-    return total_loss, losses
+    total_loss = zero_loss_float32
+    loss_breakdown_unweighted = {}
+    # Use keys from the initialized losses dict to ensure all are included
+    for k in losses.keys():
+        loss_val = losses[k]
+        weight_val = weights.get(k, 0.0) # Get corresponding weight
+        weighted_loss = jnp.asarray(weight_val) * loss_val # Ensure JAX array multiplication
+        total_loss = total_loss + weighted_loss
+        loss_breakdown_unweighted[k] = loss_val # Store unweighted loss
+
+    return total_loss, loss_breakdown_unweighted
+
 
 def calculate_boltz_binder_loss(partial_result, feature_dict, target_indices, binder_indices, binder_seq_logits, design_params):
-    """Calculate loss for BoltzDesign1-like binder design.
-    
+    """Calculate loss for BoltzDesign1-like binder design. (Refactored for JAX control flow)
+
     Args:
         partial_result: Partial model result (distogram and confidence outputs directly in dict).
         feature_dict: Feature dictionary.
-        target_indices: Indices of the target residues. 
+        target_indices: Indices of the target residues.
         binder_indices: Indices of the binder residues.
         binder_seq_logits: Sequence logits for the binder.
-        design_params: Dictionary of design parameters.
-        
+        design_params: Dictionary of design parameters (expected to be the weights dict).
+
     Returns:
         Tuple of (total_loss, loss_breakdown).
     """
-    from absl import logging
-    
     # --- Validate inputs ---
-    logging.info("==== STARTING BOLTZ BINDER LOSS CALCULATION ====")
-    logging.info(f"Target indices: {target_indices.shape}, Binder indices: {binder_indices.shape}")
-    logging.info(f"Binder logits shape: {binder_seq_logits.shape}")
-    
-    # Check for empty indices
-    if len(target_indices) == 0:
-        logging.error("Target indices array is empty! Cannot calculate loss.")
-        raise ValueError("Empty target_indices array")
-        
-    if len(binder_indices) == 0:
-        logging.error("Binder indices array is empty! Cannot calculate loss.")
-        raise ValueError("Empty binder_indices array")
+    # Using standard logging is generally okay here as validation happens before JAX transforms might deeply interfere
+    logging.info("==== STARTING BOLTZ BINDER LOSS CALCULATION (Refactored) ====")
+    # Avoid logging shapes of potential tracers directly with f-strings inside transformed functions
+    # logging.info(f"Target indices shape: {target_indices.shape}, Binder indices shape: {binder_indices.shape}")
+    # logging.info(f"Binder logits shape: {binder_seq_logits.shape}")
 
-    # Log partial_result keys
+    # Perform Python-level checks if needed, before JAX operations
+    # These checks might fail if run inside jit/grad on tracers. Best practice is to validate inputs outside.
+    # Example (assuming indices are passed as NumPy arrays or lists initially):
+    if isinstance(target_indices, (np.ndarray, list)) and len(target_indices) == 0:
+         logging.error("Target indices array is empty! Cannot calculate loss.")
+         raise ValueError("Empty target_indices array")
+    if isinstance(binder_indices, (np.ndarray, list)) and len(binder_indices) == 0:
+         logging.error("Binder indices array is empty! Cannot calculate loss.")
+         raise ValueError("Empty binder_indices array")
+
+    # Log dictionary keys (Python operations on dicts are usually fine)
     logging.info(f"partial_result keys: {list(partial_result.keys())}")
-    # Log design_params keys
-    logging.info(f"design_params keys: {list(design_params.keys())}")
-    # Log design weights
-    weights = design_params.get("weights", {})
-    logging.info(f"Design weights: {weights}")
-    
-    # Initialize losses dictionary with zero values for all potential loss terms
-    # This ensures consistent dictionary structure regardless of which losses are calculated
+    logging.info(f"design_params (weights) keys: {list(design_params.keys())}")
+
+    # design_params *is* the weights dictionary in this context
+    weights = design_params # Assume design_params is already the weights dict
+    logging.info(f"Actual Design weights passed: {weights}") # Standard logging
+
+    # Initialize losses dictionary
     losses = {
         'distogram': jnp.array(0.0, dtype=jnp.float32),
         'plddt': jnp.array(0.0, dtype=jnp.float32),
         'pae': jnp.array(0.0, dtype=jnp.float32),
         'seq_entropy': jnp.array(0.0, dtype=jnp.float32),
-        # Initialize seq_one_hot to ensure consistent structure with loss_fn_for_grad_boltz
-        'seq_one_hot': jnp.array(0.0, dtype=jnp.float32)
+        'seq_one_hot': jnp.array(0.0, dtype=jnp.float32) # Keep for consistency downstream
     }
-    
-    # Calculate losses from partial outputs (no backprop through structure module)
-    if weights.get('distogram', 0.0) > 0:
-        if 'distogram' in partial_result:
-            distogram_result = partial_result['distogram']
-            try:
-                logging.info(f"Calculating distogram loss with shapes - target: {target_indices.shape}, binder: {binder_indices.shape}")
-                distogram_loss = get_distogram_contact_loss(
-                    distogram_result, target_indices, binder_indices
-                )
-                losses['distogram'] = jnp.where(
-                    jnp.isnan(distogram_loss) | jnp.isinf(distogram_loss),
-                    jnp.array(0.0, dtype=distogram_loss.dtype),
-                    distogram_loss
-                )
-            except Exception as e:
-                logging.error(f"Error in distogram loss calculation (not logging full error due to JIT): {type(e)}")
-                losses['distogram'] = jnp.array(0.0, dtype=jnp.float32)
+    zero_loss_float32 = jnp.array(0.0, dtype=jnp.float32) # Reusable zero
+
+    # Ensure indices are JAX arrays for calculations
+    target_indices_jax = jnp.asarray(target_indices)
+    binder_indices_jax = jnp.asarray(binder_indices)
+
+    # --- Calculate Distogram Loss using jax.lax.cond ---
+    distogram_weight = weights.get('distogram', 0.0)
+
+    def calc_distogram_true(operand): # Use operand
+        pr, tgt_idx, bnd_idx = operand
+        # This check can remain Pythonic as it's checking dictionary keys
+        if 'distogram' in pr:
+            distogram_result = pr['distogram']
+            d_loss = get_distogram_contact_loss(distogram_result, tgt_idx, bnd_idx)
+            return jnp.nan_to_num(d_loss) # Handle potential NaNs
         else:
-            logging.warning("Distogram weight > 0 but 'distogram' not in partial_result, skipping")
-            pass
-    
-    # Check for confidence weight > 0 before accessing confidence keys
-    if weights.get('confidence', 0.0) > 0:
-        confidence_calculated = False # Flag to track if any confidence loss was calculated
-        # Access confidence keys directly from partial_result
-        if 'predicted_lddt' in partial_result:
-            try:
-                logging.info(f"Calculating pLDDT loss with binder shape: {binder_indices.shape}")
-                # Pass partial_result directly as it contains predicted_lddt
-                plddt_loss = get_binder_plddt_loss(partial_result, binder_indices)
-                losses['plddt'] = jnp.where(
-                    jnp.isnan(plddt_loss) | jnp.isinf(plddt_loss),
-                    jnp.array(0.0, dtype=plddt_loss.dtype),
-                    plddt_loss
-                )
-                confidence_calculated = True
-            except Exception as e:
-                logging.error(f"Error in pLDDT loss calculation (not logging full error due to JIT): {type(e)}")
-                pass
+            # Avoid logging inside true/false functions if possible
+            return zero_loss_float32
+
+    def calc_distogram_false(_): # Operand ignored
+        return zero_loss_float32
+
+    # Ensure weight is treated as a JAX value for the predicate
+    distogram_pred = jnp.greater(jnp.asarray(distogram_weight), 0.0)
+
+    losses['distogram'] = jax.lax.cond(
+        distogram_pred,
+        calc_distogram_true,
+        calc_distogram_false,
+        operand=(partial_result, target_indices_jax, binder_indices_jax) # Pass necessary data
+    )
+    # -----------------------------------------------------
+
+    # --- Calculate Confidence Losses (pLDDT, PAE) using jax.lax.cond ---
+    confidence_weight = weights.get('confidence', 0.0)
+    # Ensure weight is treated as a JAX value
+    confidence_pred = jnp.greater(jnp.asarray(confidence_weight), 0.0)
+
+    def calc_plddt_true(operand): # Use operand
+        pr, bnd_idx = operand
+        if 'predicted_lddt' in pr:
+            plddt_loss_val = get_binder_plddt_loss(pr, bnd_idx)
+            return jnp.nan_to_num(plddt_loss_val)
         else:
-            logging.warning("Confidence weight > 0 but 'predicted_lddt' not in partial_result")
+            return zero_loss_float32
 
-        if 'full_pae' in partial_result:
-            try:
-                logging.info(f"Calculating PAE loss with shapes - target: {target_indices.shape}, binder: {binder_indices.shape}")
-                 # Pass partial_result directly as it contains full_pae
-                pae_loss = get_interface_pae_loss(partial_result, target_indices, binder_indices)
-                losses['pae'] = jnp.where(
-                    jnp.isnan(pae_loss) | jnp.isinf(pae_loss),
-                    jnp.array(0.0, dtype=pae_loss.dtype),
-                    pae_loss
-                )
-                confidence_calculated = True
-            except Exception as e:
-                logging.error(f"Error in PAE loss calculation (not logging full error due to JIT): {type(e)}")
-                pass
+    def calc_plddt_false(_): # Operand ignored
+         return zero_loss_float32
+
+    losses['plddt'] = jax.lax.cond(
+        confidence_pred,
+        calc_plddt_true,
+        calc_plddt_false,
+        operand=(partial_result, binder_indices_jax) # Pass necessary data
+    )
+
+    def calc_pae_true(operand): # Use operand
+        pr, tgt_idx, bnd_idx = operand
+        if 'full_pae' in pr:
+             pae_loss_val = get_interface_pae_loss(pr, tgt_idx, bnd_idx)
+             return jnp.nan_to_num(pae_loss_val)
         else:
-             logging.warning("Confidence weight > 0 but 'full_pae' not in partial_result")
+             return zero_loss_float32
 
-        if not confidence_calculated:
-             logging.warning("Confidence weight > 0 but required keys ('predicted_lddt', 'full_pae') were missing from partial_result. Confidence loss is 0.")
+    def calc_pae_false(_): # Operand ignored
+         return zero_loss_float32
 
-    if weights.get('seq_entropy', 0.0) > 0:
-        try:
-            logging.info(f"Calculating sequence entropy loss with logits shape: {binder_seq_logits.shape}")
-            entropy_loss = get_binder_seq_entropy_loss(binder_seq_logits)
-            losses['seq_entropy'] = jnp.where(
-                jnp.isnan(entropy_loss) | jnp.isinf(entropy_loss),
-                jnp.array(0.0, dtype=entropy_loss.dtype),
-                entropy_loss
-            )
-        except Exception as e:
-            logging.error(f"Error in sequence entropy loss calculation (not logging full error due to JIT): {type(e)}")
-            pass
+    losses['pae'] = jax.lax.cond(
+        confidence_pred, # Same predicate used for PAE
+        calc_pae_true,
+        calc_pae_false,
+        operand=(partial_result, target_indices_jax, binder_indices_jax) # Pass necessary data
+    )
+    # --------------------------------------------------------------
 
-    # Calculate weighted total loss with safety checks
-    total_loss = jnp.array(0.0, dtype=jnp.float32)
-    for k, v in losses.items():
-        # Skip seq_one_hot which will be handled separately in the loss_fn_for_grad_boltz
-        if k == 'seq_one_hot':
-            continue
-        weight = weights.get(k, 0.0)
-        weighted_loss = weight * v
-        # In JAX, use functional style for accumulation
+    # --- Calculate Sequence Entropy Loss using jax.lax.cond ---
+    seq_entropy_weight = weights.get('seq_entropy', 0.0)
+    # Ensure weight is treated as a JAX value
+    seq_entropy_pred = jnp.greater(jnp.asarray(seq_entropy_weight), 0.0)
+
+    def calc_entropy_true(logits): # Pass logits as operand
+        entropy_loss_val = get_binder_seq_entropy_loss(logits)
+        return jnp.nan_to_num(entropy_loss_val)
+
+    def calc_entropy_false(_): # Operand ignored
+        return zero_loss_float32
+
+    losses['seq_entropy'] = jax.lax.cond(
+        seq_entropy_pred,
+        calc_entropy_true,
+        calc_entropy_false,
+        operand=binder_seq_logits # Pass the necessary data
+    )
+    # -------------------------------------------------------
+
+    # Calculate weighted total loss
+    total_loss = zero_loss_float32
+    loss_breakdown_unweighted = {} # Create a new dict for unweighted losses
+
+    # Iterate through the keys of the initialized losses dict for consistency
+    for k in losses:
+        if k == 'seq_one_hot': # Skip seq_one_hot handled elsewhere
+             continue
+
+        loss_val = losses[k] # Get calculated loss (already defaults to 0 if not calculated)
+
+        # Handle combined confidence weight logic
+        if k == 'plddt' or k == 'pae':
+            # Use the 'confidence' weight if present, otherwise default to 0
+            weight_val = weights.get('confidence', 0.0)
+            # If you intend separate weights, check for weights.get('plddt') etc.
+        else:
+            # Get specific weight for other loss terms
+            weight_val = weights.get(k, 0.0)
+
+        # Ensure weight is a JAX array for multiplication
+        weighted_loss = jnp.asarray(weight_val) * loss_val
         total_loss = total_loss + weighted_loss
-    
-    # Don't log directly due to JIT
-    # Instead, return the raw values to be logged outside JIT
-    logging.info("Completed loss calculation")
-    
-    return total_loss, losses 
+        loss_breakdown_unweighted[k] = loss_val # Store the unweighted loss value
+
+    # Add the placeholder for seq_one_hot back for consistent structure if needed by caller
+    loss_breakdown_unweighted['seq_one_hot'] = losses['seq_one_hot']
+
+    logging.info("Completed loss calculation (Refactored)")
+
+    # Return the dictionary including potentially zeroed values for consistent structure
+    return total_loss, loss_breakdown_unweighted
+

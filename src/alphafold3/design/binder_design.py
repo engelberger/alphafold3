@@ -534,7 +534,7 @@ class BinderDesigner:
         # Arguments: 0=logits, 1=stage, 2=temp, 3=key, 4=features, 5=tgt idx tuple, 6=bnd idx tuple, 7=weights_dict, 8=runner
         # Use the correctly defined static_argnums_for_jit
         grad_fn = jax.jit(grad_loss_fn, static_argnums=static_argnums_for_jit)
-        
+        #grad_fn = grad_loss_fn
         # Multi-stage optimization
         best_loss = float('inf')
         best_logits = None
