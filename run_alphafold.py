@@ -913,19 +913,36 @@ def process_fold_input(
                     json_safe_results[k] = v
             
             # Add the final designed sequence explicitly for easy access
-            # Need to find binder chain index dynamically
-            binder_chain_id = design_params.get('binder_chains', [''])[0] # Assume first binder chain for now
-            binder_chain_index = -1
-            for idx, chain in enumerate(new_fold_input.chains):
-                if chain.id == binder_chain_id:
-                    binder_chain_index = idx
-                    break
+            # Need to find binder chain indices and sequences dynamically
+            binder_chain_ids = design_params.get('binder_chains', [])
             
-            if binder_chain_index != -1:
-                designed_sequence = new_fold_input.chains[binder_chain_index].sequence
-                json_safe_results['final_designed_sequence'] = designed_sequence
+            # Store all designed sequences with chain IDs as keys
+            designed_sequences = {}
+            
+            # Find and store sequences for all binder chains
+            for binder_chain_id in binder_chain_ids:
+                binder_chain_index = -1
+                for idx, chain in enumerate(new_fold_input.chains):
+                    if chain.id == binder_chain_id:
+                        binder_chain_index = idx
+                        break
+                
+                if binder_chain_index != -1:
+                    designed_sequence = new_fold_input.chains[binder_chain_index].sequence
+                    designed_sequences[binder_chain_id] = designed_sequence
+                else:
+                    logging.warning(f"Could not find binder chain ID '{binder_chain_id}' in new_fold_input for seed {design_seed}")
+            
+            # Add all designed sequences to the results
+            if designed_sequences:
+                json_safe_results['final_designed_sequences'] = designed_sequences
+                # For backward compatibility, also include the first chain sequence under the old key
+                if binder_chain_ids:
+                    first_chain_id = binder_chain_ids[0]
+                    if first_chain_id in designed_sequences:
+                        json_safe_results['final_designed_sequence'] = designed_sequences[first_chain_id]
             else:
-                logging.warning(f"Could not find binder chain ID '{binder_chain_id}' in new_fold_input for seed {design_seed}")
+                logging.warning(f"No binder chain sequences were found for seed {design_seed}")
 
 
             json.dump(json_safe_results, f, indent=2, default=lambda x: '<not serializable>')
