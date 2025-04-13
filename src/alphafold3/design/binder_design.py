@@ -486,10 +486,13 @@ class BinderDesigner:
                 updated_feature_dict, step_key, stop_gradient=True
             )
             
+            # Log design_params_static for debugging
+            logging.info(f"Design params static: {design_params_static} these are the weights that go into the loss function and should be printed as: Design weights: weights")
+            jax.debug.print("Design weights: {p}", p=design_params_static)
             # Calculate BoltzDesign1 loss - use JAX arrays target_indices, binder_indices
             total_loss, loss_breakdown = binder_loss.calculate_boltz_binder_loss(
-                boltz_result, updated_feature_dict, target_indices, binder_indices, 
-                curr_binder_logits, design_params_static
+                partial_result=boltz_result, feature_dict=updated_feature_dict, target_indices=target_indices, binder_indices=binder_indices, 
+                binder_seq_logits=curr_binder_logits, design_params=design_params_static
             )
             
             # Apply additional sequence shaping in one-hot stage using JAX-compatible control flow

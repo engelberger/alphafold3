@@ -271,7 +271,8 @@ def calculate_boltz_binder_loss(partial_result, feature_dict, target_indices, bi
 
     # Log partial_result keys
     logging.info(f"partial_result keys: {list(partial_result.keys())}")
-    
+    # Log design_params keys
+    logging.info(f"design_params keys: {list(design_params.keys())}")
     # Log design weights
     weights = design_params.get("weights", {})
     logging.info(f"Design weights: {weights}")
