@@ -321,25 +321,26 @@ def get_distogram_entropy_loss(
         # Sort entropies for each residue and pick the two smallest (k=2)
         ib_sorted = jnp.sort(ib_entropy_masked, axis=-1) # Sort along the second dimension
 
-        # Handle cases where num_binder < 2 or rows have fewer than 2 valid entries
-        k_intra = 2
+        # --- JAX-compatible k-min mean using masking ---
         def pick_k_or_less(row):
-            # --- JIT-compatible way to get mean of k smallest finite values ---
-            # Take the first k elements (guaranteed to be the smallest, might contain inf)
-            first_k = row[:k_intra] # Static slice is okay
-            
-            # Count how many are finite
-            finite_mask_k = jnp.isfinite(first_k)
-            num_finite_in_k = jnp.sum(finite_mask_k)
-            
-            # Sum only the finite values among the first k
-            # Use where to turn non-finite (inf) to 0 before summing
-            sum_finite_k = jnp.sum(jnp.where(finite_mask_k, first_k, 0.0))
-            
-            # Calculate mean, avoiding division by zero
-            mean_val = jnp.where(num_finite_in_k > 0, sum_finite_k / num_finite_in_k, 0.0)
+            # row is already sorted, finite values come first
+            k_intra = 2 # Static value
+
+            # Create a mask for the first k_intra elements
+            indices = jnp.arange(row.shape[0])
+            mask = indices < k_intra
+
+            # Also mask non-finite values (like the inf used for sorting)
+            mask = mask & jnp.isfinite(row)
+
+            # Sum the masked elements and count them
+            masked_sum = jnp.sum(jnp.where(mask, row, 0.0))
+            masked_count = jnp.sum(mask) # Counts only True values in the final mask
+
+            # Calculate mean safely, return 0 if count is 0
+            mean_val = jnp.where(masked_count > 0, masked_sum / masked_count, 0.0)
             return mean_val
-            # --- End JIT-compatible fix ---
+        # --- End JAX-compatible k-min mean ---
 
         # Apply this row-wise using vmap
         per_res_intra_mean_k = jax.vmap(pick_k_or_less)(ib_sorted) # Shape (num_binder,)
@@ -365,12 +366,12 @@ def get_distogram_entropy_loss(
         it_entropy = inter_pair_entropy[jnp.ix_(binder_indices, target_indices)] # Shape (num_binder, num_target)
 
         # For each binder residue, pick the minimum entropy contact (k=1)
-        # Handle case where num_target might be 0 by returning inf
-        safe_min = lambda x: jnp.min(x) if x.shape[0] > 0 else jnp.inf
-        per_res_inter_min = jax.vmap(safe_min)(it_entropy) # Shape (num_binder,)
+        # jnp.min automatically handles empty arrays if target_indices is empty (returns inf)
+        # Use nan_to_num just in case entropy calculation resulted in NaN somewhere
+        per_res_inter_min = jnp.min(jnp.nan_to_num(it_entropy, nan=jnp.inf), axis=-1) # Shape (num_binder,)
 
         # Final inter-loss: mean over all binder residues
-        # Use nan_to_num, handle inf values by converting them to a large number or filtering
+        # Filter out inf values that result from rows with no target contacts or all NaNs/Infs
         per_res_inter_finite = jnp.where(jnp.isfinite(per_res_inter_min), per_res_inter_min, 0.0)
         finite_count = jnp.sum(jnp.isfinite(per_res_inter_min))
         # Avoid division by zero if no finite values exist
