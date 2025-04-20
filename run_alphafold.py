@@ -253,7 +253,7 @@ _NUM_RECYCLES = flags.DEFINE_integer(
     'num_recycles',
     10,
     'Number of recycles to use during inference.',
-    lower_bound=1,
+    lower_bound=0,
 )
 _NUM_DIFFUSION_SAMPLES = flags.DEFINE_integer(
     'num_diffusion_samples',

@@ -353,7 +353,7 @@ class BoltzProtocol(BinderProtocol):
         # --- Apo Warmup Phase (if ligand detected) ---
         logging.debug(f"DEBUG: Checking conditions for apo loop: has_ligand={has_ligand}, apo_template_jax is None: {apo_template_jax is None}") # <<< Explicit check before IF
         if has_ligand and apo_template_jax is not None:
-            num_apo_steps = 5 # Reduced for debugging
+            num_apo_steps = 50 # Reduced for debugging
             logging.info(f"---> Starting {num_apo_steps} apo-phase warmup iterations (no ligand) <---") # <<< Start of loop block
             # Temporarily override inter-contact weight to zero
             apo_weights = design_weights_static.copy()
