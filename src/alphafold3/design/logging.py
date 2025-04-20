@@ -156,6 +156,8 @@ def configure_logging(
     # Quiet some overly verbose loggers
     logging.getLogger('absl').setLevel(logging.WARNING)
     logging.getLogger('jax').setLevel(logging.WARNING)
+    # quiet alo matplot lib
+    logging.getLogger('matplotlib').setLevel(logging.WARNING)
     
     # Log configuration complete
     logger = get_logger("alphafold3.design.logging")

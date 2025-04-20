@@ -427,6 +427,20 @@ _METRICS_WRITE_INTERVAL = flags.DEFINE_integer(
 
 FLAGS = flags.FLAGS # Define FLAGS after all flags are defined
 
+# --- Add new flags ---
+flags.DEFINE_integer(
+    'binder_length',
+    None,
+    'If set, overrides the length of the specified binder chains with this '
+    'value, initializing the sequence with Alanines (\'A\').',
+)
+flags.DEFINE_integer(
+    'seed',
+    None,
+    'If set, overrides the random seeds specified in the input JSON with this '
+    'single seed.',
+)
+# --------------------
 
 def make_model_config(
     *,
@@ -920,16 +934,17 @@ def process_fold_input(
         # Run the design for the current seed
         design_start_time = time.time()
         design_results, final_model_result, final_feature_dict, new_fold_input = binder_design.design_binder(
-            fold_input=fold_input, # Pass original fold input (sequence is replaced inside)
-            feature_dict=initial_feature_dict, # Use features for this specific seed
+            fold_input=fold_input,
+            feature_dict=initial_feature_dict,
             model_runner=model_runner,
             ccd=ccd,
             design_params=design_params,
-            rng_seed=design_seed, # Pass the current seed
+            rng_seed=design_seed,
             buckets=buckets,
             ref_max_modified_date=ref_max_modified_date,
             conformer_max_iterations=conformer_max_iterations,
-            use_complete_prediction=True  # Use complete prediction pipeline for final structure
+            use_complete_prediction=True,
+            output_dir=output_dir
         )
         current_design_time = time.time() - design_start_time
         print(f'Binder design and final prediction for seed {design_seed} took {current_design_time:.2f} seconds.')
@@ -1367,6 +1382,39 @@ def main(_):
 
     # Define output directory for this specific job
     job_output_dir = os.path.join(_OUTPUT_DIR.value, fold_input_item.sanitised_name())
+
+    # --- Override binder length if flag is set ---
+    if FLAGS.binder_length is not None:
+        if not FLAGS.binder_chains:
+            raise ValueError("--binder_length requires --binder_chains to be set.")
+        logging.info(f"Overriding binder length to {FLAGS.binder_length} for chains {FLAGS.binder_chains}")
+        new_chains = []
+        binder_chain_ids_to_modify = set(FLAGS.binder_chains)
+        for chain in fold_input_item.chains:
+            if chain.id in binder_chain_ids_to_modify and isinstance(chain, folding_input.ProteinChain):
+                logging.info(f"Modifying length of binder chain {chain.id} to {FLAGS.binder_length}")
+                new_sequence = 'A' * FLAGS.binder_length
+                # Create a new chain with the overridden sequence and explicitly empty MSA/templates
+                modified_chain = folding_input.ProteinChain(
+                    id=chain.id,
+                    sequence=new_sequence,
+                    ptms=[], # Reset PTMs for new sequence
+                    unpaired_msa="", # Explicitly empty to skip pipeline
+                    paired_msa="",   # Explicitly empty to skip pipeline
+                    templates=[]     # Explicitly empty to skip pipeline
+                )
+                new_chains.append(modified_chain)
+            else:
+                new_chains.append(chain)
+        # Replace chains in the input object (dataclasses are immutable, need replace)
+        fold_input_item = dataclasses.replace(fold_input_item, chains=tuple(new_chains))
+    # --------------------------------------------
+
+    # --- Override seed if flag is set ---
+    if FLAGS.seed is not None:
+        logging.info(f"Overriding random seeds with single seed: {FLAGS.seed}")
+        fold_input_item = dataclasses.replace(fold_input_item, rng_seeds=(FLAGS.seed,))
+    # ----------------------------------
 
     process_fold_input(
         fold_input=fold_input_item,

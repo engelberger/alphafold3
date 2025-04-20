@@ -305,18 +305,27 @@ class Model(hk.Module):
       num_iter = self.config.num_recycles + 1
       embeddings, _ = hk.fori_loop(0, num_iter, recycle_body, (embeddings, key))
 
-    samples = self._sample_diffusion(
-        batch,
-        embeddings,
-        sample_config=self.config.heads.diffusion.eval,
-    )
-
-    # For boltz_design mode, stop gradient at the structure positions
+    # --- Conditionally skip diffusion for BoltzDesign --- 
     if mode == "boltz_design":
-      atom_positions = jax.lax.stop_gradient(samples['atom_positions'])
-      logging.info("BoltzDesign1 mode: Applied stop_gradient to atom_positions")
+        logging.info("BoltzDesign1 mode: Skipping diffusion sampling and creating dummy atom positions.")
+        # Create dummy samples
+        num_res = batch.num_res
+        max_atoms_per_token = 24 # I am not sure if this the most optimal way of stopping the diffusion heads from running when running desi
+        dummy_shape = (1, num_res, max_atoms_per_token, 3)
+        dummy_positions = jnp.zeros(dummy_shape, dtype=jnp.float32)
+        samples = {'atom_positions': dummy_positions}
+        # Ensure subsequent code uses stop_gradient version, even if it's zeros
+        atom_positions = jax.lax.stop_gradient(samples['atom_positions'])
     else:
-      atom_positions = samples['atom_positions']
+        # Standard path: run diffusion
+        logging.debug("Standard mode: Running diffusion sampling.")
+        samples = self._sample_diffusion(
+            batch,
+            embeddings,
+            sample_config=self.config.heads.diffusion.eval,
+        )
+        atom_positions = samples['atom_positions']
+    # ---------------------------------------------------
 
     # Compute dist_error_fn over all samples for distance error logging.
     confidence_output = mapping.sharded_map(

@@ -3,7 +3,7 @@
 import time
 import logging
 import copy
-from typing import Dict, Any, Tuple, Sequence
+from typing import Dict, Any, Tuple, Sequence, Optional
 
 import jax
 import jax.numpy as jnp
@@ -48,9 +48,9 @@ class BoltzProtocol(BinderProtocol):
             raise ValueError(f"Missing required features for forward pass: {missing_keys}")
 
         # Log shapes of key features
-        logging.debug(f"aatype shape: {feature_dict['aatype'].shape}, seq_mask shape: {feature_dict['seq_mask'].shape}")
-        if 'msa' in feature_dict:
-             logging.debug(f"msa shape: {feature_dict['msa'].shape}, msa_mask shape: {feature_dict.get('msa_mask', 'N/A')}")
+        #logging.debug(f"aatype shape: {feature_dict['aatype'].shape}, seq_mask shape: {feature_dict['seq_mask'].shape}")
+        #if 'msa' in feature_dict:
+        #     logging.debug(f"msa shape: {feature_dict['msa'].shape}, msa_mask shape: {feature_dict.get('msa_mask', 'N/A')}")
 
         # Run inference with 'boltz_design' mode (ModelRunner handles recycle=0)
         # It's assumed that the ModelRunner's call to the underlying model
@@ -143,13 +143,60 @@ class BoltzProtocol(BinderProtocol):
         )
         binder_logits = jnp.asarray(binder_logits, dtype=jnp.float32)
 
-        # Make a deep copy of the feature dictionary to avoid modifying the original
-        # Use JAX compatible copy if possible, fallback to deepcopy
-        try:
-            feature_dict_template = jax.tree_map(lambda x: x.copy() if hasattr(x, 'copy') else x, feature_dict)
-        except Exception:
-            logging.warning("Falling back to deepcopy for feature_dict_template")
-            feature_dict_template = copy.deepcopy(feature_dict)
+        # --- Apo/Holo Setup for Ligands --- >
+        #logging.debug(f"Feature dict keys at start of design: {list(feature_dict.keys())}")
+        feature_dict_template = copy.deepcopy(feature_dict) # Start with a mutable copy
+
+        # Log all top-level keys of the copied template for debugging detection
+        #logging.debug(f"DEBUG: Keys available in feature_dict_template: {list(feature_dict_template.keys())}")
+
+        # Detect small-molecule binder scenario
+        has_ligand = False
+        if 'is_ligand' in feature_dict_template:
+            try:
+                # Convert to JAX array and check if any element is True/non-zero
+                is_ligand_array = jnp.asarray(feature_dict_template['is_ligand'])
+                if jnp.any(is_ligand_array):
+                    has_ligand = True
+                    logging.debug("Ligand detected based on non-zero values in 'is_ligand' array.")
+                else:
+                    logging.debug("'is_ligand' key found, but contains only zeros. No ligand detected.")
+            except Exception as e:
+                logging.warning(f"Could not process 'is_ligand' array for ligand detection: {e}")
+        else:
+            logging.debug("'is_ligand' key not found in features. No ligand detected.")
+
+        apo_template_jax = None
+        if has_ligand:
+            logging.info("Small-molecule target detected: preparing apo -> holo two-phase schedule")
+            # Apo phase: strip out ligand–binder coordinates/features
+            apo_template = copy.deepcopy(feature_dict_template)
+            keys_removed = []
+            # Define keys to remove (data-related, keep boolean flags like is_ligand)
+            keys_to_remove_for_apo = [
+                'small_molecule_metadata', 'sm_metadata',
+                'small_molecule_atom_positions', 'sm_atom_positions', 'ligand_atom_positions',
+                'small_molecule_mask', 'sm_mask', 'ligand_mask',
+                'ligand_features', 'sm_features',
+                'residue_smiles',
+                'polymer_ligand_bonds', # Bonds involving ligands
+                'ligand_ligand_bonds'
+                # Keep 'is_ligand' key itself, model might need it
+            ]
+            for k in keys_to_remove_for_apo:
+                # Check against the specific removal list
+                if k in apo_template:
+                    del apo_template[k]
+                    keys_removed.append(k)
+            logging.info(f"Removed keys for apo template: {keys_removed}")
+            apo_template_jax = freeze_containers_for_jax(apo_template)
+
+        else:
+            logging.info("No small-molecule target detected based on feature keys/token_types. Running standard single-phase schedule.")
+
+        # Holo phase (or standard template if no ligand): full feature dict
+        holo_template_jax = freeze_containers_for_jax(feature_dict_template)
+        # <--- End Apo/Holo Setup ---
 
         # Extract weights for static compilation (ensure it's a standard dict)
         design_weights_static = dict(self.design_params.get("weights", {}))
@@ -191,6 +238,10 @@ class BoltzProtocol(BinderProtocol):
         feature_dict_template_jax = freeze_containers_for_jax(feature_dict_template)
         model_runner_obj = self.model_runner # Passed by reference
 
+        # Arguments to be passed to loss_fn_for_grad_boltz
+        # Initialize custom args for loss function (used in holo phase)
+        loss_fn_custom_args = {}
+
         # Define loss function for gradient calculation (inside design method)
         def loss_fn_for_grad_boltz(
             current_binder_logits,  # Differentiable
@@ -203,7 +254,9 @@ class BoltzProtocol(BinderProtocol):
             target_idxs,            # Static
             binder_idxs,            # Static
             design_weights,         # Static
-            model_runner_ref        # Static
+            model_runner_ref,       # Static
+            inter_k_arg: Optional[int] = None, # Holo specific k
+            inter_l_arg: Optional[int] = None # Holo specific l
         ):
             # Determine sequence representation based on stage
             # Assuming 4 core stages: 0:Warm-up, 1:Mixed, 2:Anneal, 3:STE
@@ -260,7 +313,8 @@ class BoltzProtocol(BinderProtocol):
             )
 
             # Run the specialized forward pass
-            boltz_result = self._boltz_forward_pass(updated_feature_dict, iter_key) # Pass original key
+            # Use the correct template (apo or holo)
+            boltz_result = self._boltz_forward_pass(updated_feature_dict, iter_key)
 
             # Calculate loss using the selected sequence representation
             total_loss, loss_breakdown = calculate_boltzdesign_binder_loss(
@@ -269,7 +323,10 @@ class BoltzProtocol(BinderProtocol):
                 target_idxs,
                 binder_idxs,
                 seq_representation, # Pass the representation used
-                design_params={'weights': design_weights}
+                design_params={'weights': design_weights},
+                compute_confidence_loss=True, # Default unless overridden by mode
+                inter_k=inter_k_arg,
+                inter_l=inter_l_arg
             )
 
             # Add sequence entropy loss based on soft probabilities in hard stage (STE stage)
@@ -293,12 +350,64 @@ class BoltzProtocol(BinderProtocol):
         optimizer = optax.adam(learning_rate=self.design_params.get("learning_rate", 0.01)) # Use base LR for now
         opt_state = optimizer.init(binder_logits)
 
+        # --- Apo Warmup Phase (if ligand detected) ---
+        logging.debug(f"DEBUG: Checking conditions for apo loop: has_ligand={has_ligand}, apo_template_jax is None: {apo_template_jax is None}") # <<< Explicit check before IF
+        if has_ligand and apo_template_jax is not None:
+            num_apo_steps = 5 # Reduced for debugging
+            logging.info(f"---> Starting {num_apo_steps} apo-phase warmup iterations (no ligand) <---") # <<< Start of loop block
+            # Temporarily override inter-contact weight to zero
+            apo_weights = design_weights_static.copy()
+            apo_weights['contact_inter'] = 0.0
+
+            # Use grad_fn with apo template
+            for apo_step in range(num_apo_steps):
+                apo_iter_start_time = time.time()
+                logging.debug(f"  DEBUG: Entering Apo iter {apo_step+1}/{num_apo_steps}") # <<< Start of iteration
+                rng_key, iter_key = jax.random.split(rng_key)
+                try:
+                    (loss_val, loss_bd), grads = grad_fn(
+                        binder_logits,
+                        stage_idx_static=2, # Use softmax representation (Anneal stage logic)
+                        temp_static=1.0,    # Fixed temp
+                        progress_static=0.0, # Fixed progress
+                        iter_key=iter_key,
+                        # Static args
+                        feature_dict_tmpl=apo_template_jax, # <-- Use APO template
+                        target_idxs=target_indices_jnp,
+                        binder_idxs=binder_indices_jnp,
+                        design_weights=apo_weights, # <-- Use APO weights
+                        model_runner_ref=model_runner_obj
+                        # No inter_k/l needed for apo
+                    )
+                    updates, opt_state = optimizer.update(grads, opt_state)
+                    binder_logits = optax.apply_updates(binder_logits, updates)
+                    # Log progress
+                    logging.debug(f"  DEBUG: Apo iter {apo_step+1} loss calculated: {safe_jax_to_float(loss_val):.4f}") # <<< After calculation
+                    if apo_step % 10 == (10 - 1):
+                        apo_iter_time = time.time() - apo_iter_start_time
+                        logging.info(f"  ---> Apo iter {apo_step+1}/{num_apo_steps} loss={safe_jax_to_float(loss_val):.3f} time={apo_iter_time:.2f}s <---") # <<< Periodic INFO log
+                except Exception as e:
+                    logging.error(f"Error during Apo iteration {apo_step}: {e}", exc_info=True)
+                    break # Exit apo loop on error
+
+            # --- Holo Phase Setup (if ligand detected) ---
+            logging.info("---> Switching to holo phase: optimizing ligand contacts (k=1, l=1) <---") # <<< End of apo block / start of holo setup
+            # Restore original weights (already in design_weights_static)
+            # Set custom args for the loss function to trigger k=1,l=1 behavior
+            loss_fn_custom_args = {'inter_k': 1, 'inter_l': 1}
+            current_template_jax = holo_template_jax # Use holo template for main stages
+        else:
+            # If no ligand, just use the standard template
+            current_template_jax = holo_template_jax # Holo template IS the standard template
+            loss_fn_custom_args = {}
+        # <--- End Apo/Holo Setup ---
+
         best_loss = float('inf')
         best_logits = None
         best_metrics = None
         best_feature_dict = None # Store the feature dict corresponding to best_logits
         trajectory = {
-            "step": [], "loss": [], "plddt": [], "pae_inter": [], "contact_inter": [],
+            "step": [], "loss": [], "plddt": [], "pae_loss": [], "contact_inter": [],
              "contact_intra": [], "time": []
         }
 
@@ -335,11 +444,14 @@ class BoltzProtocol(BinderProtocol):
                         progress,  # Static
                         iter_key,  # Varies
                         # Static args
-                        feature_dict_template_jax,
+                        current_template_jax,
                         target_indices_jnp,
                         binder_indices_jnp,
                         design_weights_static,
-                        model_runner_obj
+                        model_runner_obj,
+                        # Pass k/l explicitly
+                        inter_k_arg=loss_fn_custom_args.get('inter_k'),
+                        inter_l_arg=loss_fn_custom_args.get('inter_l')
                     )
 
                     if jnp.isnan(loss_val) or jnp.isinf(loss_val):
@@ -351,14 +463,16 @@ class BoltzProtocol(BinderProtocol):
                     binder_logits = optax.apply_updates(binder_logits, updates)
 
                     # Log metrics (extract from loss_breakdown)
-                    plddt = 1.0 - loss_breakdown.get("plddt", 1.0) # Convert loss back to score
-                    pae_inter = loss_breakdown.get("pae_inter", float('nan'))
+                    plddt_loss_neg_mean = loss_breakdown.get("plddt_neg_mean", 0.0)
+                    plddt_score = safe_jax_to_float(-plddt_loss_neg_mean) # Actual pLDDT score (0-100)
+                    pae_loss = loss_breakdown.get("pae_inter_mean", float('nan')) # Key used in boltzdesign loss
                     contact_inter = loss_breakdown.get("contact_inter", float('nan'))
                     contact_intra = loss_breakdown.get("contact_intra", float('nan'))
                     iter_time = time.time() - iter_start_time
 
+                    # Adjust log format for pLDDT (0-100 scale)
                     log_line = (f"Iter {current_iter} [{stage_idx}] Loss={safe_jax_to_float(loss_val):.3f} "
-                                f"pLDDT={plddt:.3f} PAE_inter={safe_jax_to_float(pae_inter):.3f} "
+                                f"pLDDT={plddt_score:.1f} PAE_loss={safe_jax_to_float(pae_loss):.3f} "
                                 f"Cont_inter={safe_jax_to_float(contact_inter):.3f} Cont_intra={safe_jax_to_float(contact_intra):.3f} "
                                 f"Temp={temp:.3f} Time={iter_time:.2f}s")
                     if current_iter % 10 == 0:
@@ -369,8 +483,8 @@ class BoltzProtocol(BinderProtocol):
                     # Store trajectory
                     trajectory["step"].append(current_iter)
                     trajectory["loss"].append(safe_jax_to_float(loss_val))
-                    trajectory["plddt"].append(plddt)
-                    trajectory["pae_inter"].append(safe_jax_to_float(pae_inter))
+                    trajectory["plddt"].append(plddt_score)
+                    trajectory["pae_loss"].append(safe_jax_to_float(pae_loss))
                     trajectory["contact_inter"].append(safe_jax_to_float(contact_inter))
                     trajectory["contact_intra"].append(safe_jax_to_float(contact_intra))
                     trajectory["time"].append(iter_time)
@@ -381,17 +495,18 @@ class BoltzProtocol(BinderProtocol):
                         best_logits = binder_logits.copy()
                         best_metrics = {
                             "loss": safe_jax_to_float(loss_val),
-                            "plddt": plddt,
-                            "pae_inter": safe_jax_to_float(pae_inter),
+                            # Store the actual pLDDT score (0-100)
+                            "plddt_score": plddt_score,
+                            "pae_loss": safe_jax_to_float(pae_loss),
                             "contact_inter": safe_jax_to_float(contact_inter),
                             "contact_intra": safe_jax_to_float(contact_intra)
                         }
                         # Regenerate feature dict for the best logits
                         logging.debug(f"Iter {current_iter}: New best found. Regenerating feature dict.")
                         best_feature_dict = binder_utils.update_features_from_logits(
-                             feature_dict_template_jax, binder_indices_jnp, best_logits
+                             current_template_jax, binder_indices_jnp, best_logits
                         )
-                        logging.info(f"Iter {current_iter}: New best loss={best_metrics['loss']:.4f} pLDDT={best_metrics['plddt']:.3f}")
+                        logging.info(f"Iter {current_iter}: New best loss={best_metrics['loss']:.4f} pLDDT={best_metrics['plddt_score']:.1f}")
 
                     current_iter += 1
 
@@ -420,7 +535,7 @@ class BoltzProtocol(BinderProtocol):
         if best_feature_dict is None:
              logging.warning("Regenerating best_feature_dict from best_logits at the end.")
              best_feature_dict = binder_utils.update_features_from_logits(
-                 feature_dict_template_jax, binder_indices_jnp, best_logits
+                 current_template_jax, binder_indices_jnp, best_logits
              )
 
         # Final sequence details
@@ -441,11 +556,13 @@ class BoltzProtocol(BinderProtocol):
             "final_aa_indices": [int(aa) for aa in final_aa_indices],
             "final_sequence": final_sequence,
             "best_feature_dict": best_feature_dict,
-            "success": best_metrics.get("plddt", 0.0) > 0.7 # Example success criterion
+            # Use the calculated positive plddt_score for success check
+            "success": best_metrics.get("plddt_score", 0.0) > 70.0 # Example threshold 70
         }
 
         logging.info(f"Boltz design completed in {design_results['design_time']:.2f}s")
-        logging.info(f"Best loss: {design_results['best_loss']:.4f}, Final pLDDT: {best_metrics.get('plddt', 0.0):.3f}")
+        # Use the correct key for logging the final score
+        logging.info(f"Best loss: {design_results['best_loss']:.4f}, Best pLDDT score: {best_metrics.get('plddt_score', 0.0):.1f}")
         logging.info(f"Final sequence: {final_sequence}")
 
         return design_results, best_feature_dict

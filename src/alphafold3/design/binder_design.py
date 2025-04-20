@@ -2,7 +2,7 @@
 
 import time
 import functools
-from typing import Dict, Any, Tuple, Sequence 
+from typing import Dict, Any, Tuple, Sequence, Optional
 import datetime
 import gc
 import copy
@@ -46,6 +46,7 @@ from alphafold3.design.losses import (
 )
 # Import protocols
 from alphafold3.design.protocols import BinderProtocol, GradientProtocol, BoltzProtocol
+from alphafold3.design import plotting
 
 def freeze_containers_for_jax(obj):
     """Makes a nested structure of dicts and lists JAX-compatible by making them immutable.
@@ -167,6 +168,7 @@ def design_binder(
     ref_max_modified_date: datetime.date | None = None,
     conformer_max_iterations: int | None = None,
     use_complete_prediction: bool = True,
+    output_dir: Optional[str] = None,
 ) -> Tuple[Dict[str, Any], model.ModelResult, features.BatchDict, folding_input.Input]:
     """Design a binder protein using AlphaFold 3.
     
@@ -182,6 +184,7 @@ def design_binder(
         conformer_max_iterations: Optional iterations for conformer generation.
         use_complete_prediction: Whether to use the comprehensive prediction method
                                  or the simplified one for the final structure.
+        output_dir: Optional path to the output directory for saving plots.
         
     Returns:
         Tuple of (design_results, final_model_result, final_feature_dict, new_fold_input).
@@ -222,6 +225,19 @@ def design_binder(
         final_model_result, final_feature_dict, new_fold_input = designer.protocol_instance.run_final_prediction(
             fold_input, design_results, final_pred_key
         )
+    
+    # --- Plotting Trajectory --- >
+    if output_dir and "trajectory" in design_results:
+        try:
+            plot_filename_prefix = f"{fold_input.name}_seed_{rng_seed}_design"
+            plotting.plot_design_trajectory(
+                design_results=design_results,
+                output_dir=output_dir,
+                plot_filename_prefix=plot_filename_prefix,
+            )
+        except Exception as e:
+            logging.error(f"Failed to plot design trajectory: {e}", exc_info=True)
+    # <--- End Plotting ---
     
     return design_results, final_model_result, final_feature_dict, new_fold_input 
 

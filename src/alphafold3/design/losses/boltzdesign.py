@@ -18,6 +18,8 @@ def calculate_boltzdesign_distogram_loss(
     binder_indices: jnp.ndarray,
     target_indices: jnp.ndarray,
     weights: Dict[str, float],
+    inter_k: Optional[int] = None, # Override for k-min aggregation
+    inter_l: Optional[int] = None, # Override for l-mean aggregation
 ) -> Tuple[jnp.ndarray, Dict[str, jnp.ndarray]]:
     """Calculates the distogram entropy loss for BoltzDesign.
 
@@ -31,6 +33,8 @@ def calculate_boltzdesign_distogram_loss(
         binder_indices: 1D array of indices corresponding to binder residues.
         target_indices: 1D array of indices corresponding to target residues.
         weights: Dictionary containing loss weights ('contact_intra', 'contact_inter').
+        inter_k: Optional override for number of best contacts per residue (default 1).
+        inter_l: Optional override for number of best residues to average (default all).
 
     Returns:
         Tuple of (total_distogram_loss, distogram_loss_breakdown).
@@ -77,17 +81,50 @@ def calculate_boltzdesign_distogram_loss(
         loss_breakdown['contact_intra'] = 0.0
 
     w_inter = weights.get('contact_inter', 0.0)
+    inter_loss_val = 0.0 # Initialize
     if w_inter > 0:
         # Inter-chain loss (binding interface)
         it_entropy = inter_pair_entropy[jnp.ix_(binder_indices, target_indices)] # (Lb, Lt)
 
-        # k=1 aggregation: minimum entropy contact per binder residue to any target residue
-        per_res_inter_entropy = jnp.min(it_entropy, axis=-1) # (Lb,)
+        # Default k=1, l=Lb (mean of min contact per binder residue)
+        k = 1
+        l = len(binder_indices)
 
-        # l=binder_length aggregation: mean over all binder residues
-        inter_loss = jnp.mean(per_res_inter_entropy)
-        total_loss += w_inter * inter_loss
-        loss_breakdown['contact_inter'] = inter_loss
+        # Override k, l if provided (specifically for holo phase)
+        if inter_k is not None:
+            k = inter_k
+            logger.debug(f"Using override inter_k={k}")
+        if inter_l is not None:
+            l = inter_l
+            logger.debug(f"Using override inter_l={l}")
+
+        # Ensure k and l are within valid bounds
+        num_targets = it_entropy.shape[1]
+        num_binders = it_entropy.shape[0]
+        k = min(k, num_targets) if num_targets > 0 else 1
+        l = min(l, num_binders) if num_binders > 0 else 1
+
+        # Calculate per-binder-residue best k contacts
+        # Sort contacts for each binder residue: (Lb, Lt) -> (Lb, Lt)
+        it_sorted = jnp.sort(it_entropy, axis=-1)
+
+        # Select top k contacts: (Lb, Lt) -> (Lb, k)
+        # Handle case where k > num_targets safely
+        top_k_contacts = it_sorted[:, :k]
+
+        # Average the top k contacts for each binder residue: (Lb, k) -> (Lb,)
+        per_res_mean_top_k = jnp.mean(top_k_contacts, axis=-1)
+
+        # Select the top l binder residues based on their mean top-k contact entropy
+        # Sort binder residues by their score: (Lb,) -> (Lb,)
+        binder_scores_sorted = jnp.sort(per_res_mean_top_k)
+
+        # Take the mean of the best l binder residues
+        # Handle case where l > num_binders safely
+        inter_loss_val = jnp.mean(binder_scores_sorted[:l])
+
+        total_loss += w_inter * inter_loss_val
+        loss_breakdown['contact_inter'] = inter_loss_val
     else:
         loss_breakdown['contact_inter'] = 0.0
 
@@ -100,7 +137,9 @@ def calculate_boltzdesign_binder_loss(
     binder_indices: jnp.ndarray,
     seq_representation: jnp.ndarray, # Softmax probs or STE
     design_params: Dict[str, Any],   # Contains weights dict
-    compute_confidence_loss: bool = True # Flag to control confidence loss computation
+    compute_confidence_loss: bool = True, # Flag to control confidence loss computation
+    inter_k: Optional[int] = None, # Holo phase k override
+    inter_l: Optional[int] = None # Holo phase l override
 ) -> Tuple[jnp.ndarray, Dict[str, jnp.ndarray]]:
     """Calculates the combined loss for the BoltzDesign protocol.
 
@@ -116,6 +155,8 @@ def calculate_boltzdesign_binder_loss(
         design_params: Dictionary containing design parameters, including 'weights'.
         compute_confidence_loss: If True, compute and add pLDDT/PAE losses.
                                    Defaults to True for backward compatibility.
+        inter_k: Optional override for k in inter-chain distogram loss.
+        inter_l: Optional override for l in inter-chain distogram loss.
 
     Returns:
         Tuple containing the total loss and a dictionary breakdown of loss components.
@@ -138,7 +179,9 @@ def calculate_boltzdesign_binder_loss(
             bin_edges=partial_result['distogram']['bin_edges'],
             binder_indices=binder_indices,
             target_indices=target_indices,
-            weights=weights
+            weights=weights,
+            inter_k=inter_k,
+            inter_l=inter_l
         )
         total_loss += distogram_loss
         loss_breakdown.update(disto_breakdown)
