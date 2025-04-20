@@ -34,6 +34,7 @@ import textwrap
 import time
 import typing
 from typing import overload, Optional, Dict, Any
+import copy
 
 from absl import app
 from absl import flags
@@ -384,6 +385,40 @@ flags.DEFINE_enum('mask_token', 'X', _VALID_MASK_TOKENS,
                   'Amino acid character to use for masking MSA positions.')
 
 
+# --- Logging and Metrics ---
+_LOG_LEVEL = flags.DEFINE_string(
+    'log_level',
+    'INFO',
+    'Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL)',
+)
+_LOG_FORMAT = flags.DEFINE_enum(
+    'log_format',
+    'pretty',
+    ['pretty', 'json', 'tsv'],
+    'Format for logs (pretty=human readable, json=structured JSON, tsv=tab separated)',
+)
+_LOG_FILE = flags.DEFINE_string(
+    'log_file',
+    None,
+    'Optional file path to write logs to (in addition to console)',
+)
+_LOG_CONFIG_FILE = flags.DEFINE_string(
+    'log_config_file',
+    None,
+    'Optional JSON or YAML file with detailed logging configuration',
+)
+_METRICS_FORMAT = flags.DEFINE_enum(
+    'metrics_format',
+    'json',
+    ['json', 'csv'],
+    'Format for metrics files (json=JSONL, csv=comma separated)',
+)
+_METRICS_WRITE_INTERVAL = flags.DEFINE_integer(
+    'metrics_write_interval',
+    10,
+    'How often to write metrics files (every N steps)',
+)
+
 # set TF_FORCE_UNIFIED_MEMORY=true and XLA_PYTHON_CLIENT_MEM_FRACTION=3.2
 #os.environ["TF_FORCE_UNIFIED_MEMORY"] = "true"
 #os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "3.2"
@@ -444,17 +479,21 @@ class ModelRunner:
     )
 
   def run_inference(
-      self, featurised_example: features.BatchDict, rng_key: jnp.ndarray, mode: str | None = None
+      self, featurised_example: features.BatchDict, rng_key: jnp.ndarray, mode: str | None = None,
+      # Add optional override for number of recycles
+      num_recycles_override: Optional[int] = None
   ) -> model.ModelResult:
     """Computes a forward pass of the model on a featurised example.
-    
+
     Args:
         featurised_example: Featurized input data.
         rng_key: JAX random key.
         mode: Optional mode to run the model in. Options:
             None (default): Standard prediction mode.
-            "boltz_design": BoltzDesign1 mode that stops gradients at the structure module.
-            
+            "boltz_design": BoltzDesign1 mode (may trigger modifications like recycles=0).
+        num_recycles_override: If set, overrides the default number of recycles
+                                 from the model config.
+
     Returns:
         Model results from the forward pass.
     """
@@ -465,8 +504,41 @@ class ModelRunner:
         self._device,
     )
 
-    result = self._model(rng_key, featurised_example, mode)
-    
+    # Prepare a copy of the config to potentially modify
+    current_config = copy.deepcopy(self._model_config)
+
+    # Override recycles if specified or if in boltz_design mode (set to 0)
+    if num_recycles_override is not None:
+        current_config.num_recycles = num_recycles_override
+        logging.debug(f"Overriding num_recycles to {num_recycles_override}")
+    elif mode == "boltz_design":
+        original_recycles = current_config.num_recycles
+        current_config.num_recycles = 0
+        logging.debug(f"Setting num_recycles to 0 for boltz_design mode (original: {original_recycles})")
+
+    # --- Dynamically create the forward function with potentially modified config --- 
+    # This ensures the correct config (e.g., num_recycles=0) is used for this specific call
+    # We avoid caching this modified forward function to prevent conflicts
+    @hk.transform
+    def modified_forward_fn(batch, mode_inner=None):
+        # Use the potentially modified current_config
+        return model.Model(current_config)(batch, mode=mode_inner)
+
+    # JIT compile the modified function for this call
+    # Note: This recompiles if config changes, which is expected for boltz_design mode
+    jitted_modified_model = jax.jit(modified_forward_fn.apply, static_argnames=["mode_inner"], device=self._device)
+    result = jitted_modified_model(self.model_params, rng_key, featurised_example, mode_inner=mode)
+    # --------------------------------------------------------------------------------
+
+    # Apply stop_gradient to the entire result dictionary for boltz_design mode.
+    # NOTE: This is a coarse application. Ideally, stop_gradient should be applied
+    # more selectively, e.g., only to structure module outputs before they are used
+    # by the confidence head (if confidence is calculated separately).
+    # A more refined approach might require modifying the ModelRunner or Model itself.
+    if mode == "boltz_design":
+        logging.debug("Applying stop_gradient to the full result in boltz_design mode (Coarse Implementation)")
+        result = jax.lax.stop_gradient(result)
+
     # Skip NumPy conversion when in boltz_design mode to avoid TracerArrayConversionError
     # This is needed because boltz_design mode runs within a JAX JIT context
     if mode != "boltz_design":
@@ -1264,6 +1336,25 @@ def main(_):
   else:
     logging.info("Running standard folding protocol.")
   # ---------------------------
+
+  # --- Setup Logging ---
+  try:
+    from alphafold3.design import logging as af_logging
+    af_logging.configure_logging(
+        log_level=_LOG_LEVEL.value,
+        log_format=_LOG_FORMAT.value,
+        log_file=_LOG_FILE.value,
+        config_file=_LOG_CONFIG_FILE.value,
+    )
+    logging.info("Custom logging configured successfully.")
+  except ImportError as e:
+    # Fallback to basic logging if our module isn't available
+    logging.warning(f"Could not import design logging module: {e}. Using default logging.")
+    logging.basicConfig(
+        level=getattr(logging, _LOG_LEVEL.value.upper(), logging.INFO),
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    )
+  # ----------------------
 
   # --- Process Each Input ---
   num_fold_inputs_processed = 0
