@@ -334,8 +334,11 @@ _BOLTZ_STAGE3_STEPS = flags.DEFINE_integer(
 _BOLTZ_STAGE4_STEPS = flags.DEFINE_integer(
     'boltz_stage4_steps', 50, 'Steps for BoltzDesign1 Stage 4 (one-hot).'
 )
-_BOLTZ_DISTOGRAM_WEIGHT = flags.DEFINE_float(
-    'boltz_distogram_weight', 1.0, 'Weight for distogram contact loss (Boltz protocol).'
+_BOLTZ_CONTACT_INTRA_WEIGHT = flags.DEFINE_float(
+    'boltz_contact_intra_weight', 1.0, 'Weight for intra-binder distogram entropy loss (Boltz protocol).'
+)
+_BOLTZ_CONTACT_INTER_WEIGHT = flags.DEFINE_float(
+    'boltz_contact_inter_weight', 1.0, 'Weight for inter-face distogram entropy loss (Boltz protocol).'
 )
 _BOLTZ_CONFIDENCE_WEIGHT = flags.DEFINE_float(
     'boltz_confidence_weight', 0.5, 'Weight for confidence loss (pLDDT/PAE) (Boltz protocol).'
@@ -1252,7 +1255,8 @@ def main(_):
             FLAGS.boltz_stage4_steps
         ]
         design_params["weights"].update({
-            "distogram": FLAGS.boltz_distogram_weight,
+            "contact_intra": FLAGS.boltz_contact_intra_weight,
+            "contact_inter": FLAGS.boltz_contact_inter_weight,
             "confidence": FLAGS.boltz_confidence_weight,
         })
         # Add clear_memory_interval to enable memory optimization
