@@ -42,7 +42,7 @@ class GradientProtocol(BinderProtocol):
         Returns:
             Tuple of (design_results, final_feature_dict).
         """
-        logging.info("Starting gradient-based binder design...")
+        logging.info(f"Starting gradient-based binder design (lr={self.config.learning_rate}, steps={self.config.gradient_config.steps})...")
         design_start_time = time.time()
 
         # Initialize sequence logits randomly
@@ -53,7 +53,7 @@ class GradientProtocol(BinderProtocol):
         )
 
         # Setup optimizer
-        lr = self.design_params.get("lr", 0.1)
+        lr = self.config.learning_rate
         optimizer = optax.adam(learning_rate=lr)
         opt_state = optimizer.init(binder_seq_logits)
 
@@ -64,17 +64,11 @@ class GradientProtocol(BinderProtocol):
         logging.debug(f"Feature_dict_jax keys: {list(feature_dict_jax.keys())}")
 
         # Setup logging and trajectory storage
-        trajectory = {
-            "loss": [],
-            "losses": [],
-            "step": [],
-            "time": [],
-            "sequences": [],
-        }
+        trajectory = {"step": [], "loss": [], "losses": [], "time": [], "sequences": []}
 
         # Define loss function for gradient calculation (inside design method)
         def loss_fn_for_grad(curr_binder_logits, feature_dict_template, target_indices_static,
-                            binder_indices_static, design_params_static, model_runner_obj, current_rng_key):
+                            binder_indices_static, weights_dict_static, model_runner_obj, current_rng_key):
             # Convert static tuples back if needed (though JAX usually handles arrays)
             target_indices_arr = jnp.array(target_indices_static)
             binder_indices_arr = jnp.array(binder_indices_static)
@@ -89,23 +83,23 @@ class GradientProtocol(BinderProtocol):
             # Run full forward pass
             result = model_runner_obj.run_inference(updated_feature_dict, current_rng_key)
 
-            # Calculate loss
+            # Calculate loss using static weights dict
             total_loss, loss_breakdown = calculate_gradient_binder_loss(
                 result, updated_feature_dict, target_indices_arr, binder_indices_arr,
-                curr_binder_logits, design_params_static
+                curr_binder_logits, weights_dict_static
             )
 
             # Return loss and breakdown for value_and_grad
             return total_loss, loss_breakdown
 
-        # Create gradient function (without JIT decoration)
+        # Create gradient function (without JIT)
         grad_fn = jax.value_and_grad(loss_fn_for_grad, has_aux=True)
 
         # Standard optimization loop
         best_loss = float('inf')
         best_logits = None
         best_feature_dict = None
-        steps = self.design_params.get("steps", 200)
+        steps = self.config.gradient_config.steps
 
         # Convert numpy arrays to JAX arrays for JIT compatibility if used inside grad_fn
         target_indices_jnp = jnp.array(target_indices)
@@ -115,54 +109,48 @@ class GradientProtocol(BinderProtocol):
             step_start_time = time.time()
             step_key, rng_key = jax.random.split(rng_key)
 
-            # Compute gradients
-            # Pass static args. Note: design_params dict might not be JAX-traceable directly
-            # Consider passing only necessary weights or making it a static arg if JIT applied here
+            # Compute gradients, passing only static weights dict from config
+            w = self.config.gradient_config.weights
+            weights_dict = {"weights": {"plddt": w.gradient_plddt,
+                                          "pae_inter": w.gradient_pae_inter,
+                                          "contact": w.gradient_contact_inter,
+                                          "seq_entropy": w.seq_entropy}}
             (loss, losses), grads = grad_fn(
-                binder_seq_logits,      # Differentiable
-                feature_dict_jax,       # Static template
-                target_indices_jnp,     # Static indices
-                binder_indices_jnp,     # Static indices
-                self.design_params,     # Static parameters (might need freezing/subsetting for JIT)
-                self.model_runner,      # Static object (passed by reference)
-                step_key                # Varies
+                binder_seq_logits,
+                feature_dict_jax,
+                target_indices_jnp,
+                binder_indices_jnp,
+                weights_dict,           # Static weights
+                self.model_runner,
+                step_key
             )
 
             # Update logits
             updates, opt_state = optimizer.update(grads, opt_state, binder_seq_logits)
             binder_seq_logits = optax.apply_updates(binder_seq_logits, updates)
 
-            # Get loss value for logging
-            step_loss_val = loss
-            step_losses_val = losses
-
-            # Log progress
+            # Logging and trajectory update
             step_time = time.time() - step_start_time
-            if step % 10 == 0 or step == steps - 1:
-                probs = jax.nn.softmax(binder_seq_logits, axis=-1)
-                aa_indices = jnp.argmax(probs, axis=-1)
-
-                # Convert to amino acid sequence
-                aa_letters = 'ACDEFGHIKLMNPQRSTVWY'
-                aa_indices_py = [int(idx) for idx in aa_indices]
-                current_seq = ''.join([aa_letters[idx] for idx in aa_indices_py])
-
-                logging.info(f"Step {step}/{steps}: loss={safe_jax_to_float(step_loss_val):.4f}, time={step_time:.2f}s")
-                safe_losses = safe_process_losses(step_losses_val)
-                logging.info(f"Losses: {safe_losses}")
-
-                trajectory["sequences"].append(current_seq)
-
-            # Store in trajectory (potentially large if storing JAX arrays)
-            # Consider storing only scalar loss values
-            trajectory["loss"].append(safe_jax_to_float(step_loss_val))
-            trajectory["losses"].append(safe_process_losses(step_losses_val))
+            # Build structured log_data
+            log_data = {
+                "step": step,
+                "loss": safe_jax_to_float(loss),
+                # Flatten losses dict for logging
+                **safe_process_losses(losses)
+            }
+            # Print log line based on verbosity
+            if step % self.config.verbosity == 0 or step == steps - 1:
+                from alphafold3.design.utils import print_log_line
+                print_log_line(f"Step {step}/{steps}", log_data)
+            # Store trajectory
             trajectory["step"].append(step)
+            trajectory["loss"].append(log_data["loss"])
+            trajectory["losses"].append({k: v for k, v in log_data.items() if k not in ["step", "loss"]})
             trajectory["time"].append(step_time)
 
             # Track best loss
-            if step_loss_val < best_loss:
-                best_loss = step_loss_val # Keep as JAX array for comparison
+            if log_data["loss"] < best_loss:
+                best_loss = log_data["loss"]
                 best_logits = binder_seq_logits
 
                 # Regenerate best feature dict only when a new best is found
@@ -189,32 +177,29 @@ class GradientProtocol(BinderProtocol):
 
         # Final sequence generation from best logits
         if best_logits is None:
-             logging.warning("No best logits found, design may have failed. Using last logits.")
-             best_logits = binder_seq_logits # Fallback
+            logging.warning("No best logits found, design may have failed. Using last logits.")
+            best_logits = binder_seq_logits
 
-        final_probs = jax.nn.softmax(best_logits, axis=-1)
-        final_aa_indices = jnp.argmax(final_probs, axis=-1)
-
-        # If best_feature_dict wasn't generated (e.g., loss never improved)
+        # If best_feature_dict wasn't generated (e.g., no improvement), regenerate
         if best_feature_dict is None:
-             logging.warning("Best feature dict not generated, regenerating from final logits.")
-             best_feature_dict = binder_utils.update_features_from_logits(
-                 feature_dict_jax,
-                 binder_indices_jnp,
-                 best_logits
-             )
+            logging.warning("Best feature dict not generated, regenerating from final logits.")
+            best_feature_dict = binder_utils.update_features_from_logits(
+                feature_dict_jax, # Use the JAX-compatible version
+                binder_indices_jnp,
+                best_logits
+            )
 
         # Prepare results
         design_results = {
-            "protocol": "binder_gradient",
+            "protocol": self.protocol,
+            "steps": steps,
+            "final_seq_logits": best_logits,
+            "trajectory": trajectory,
+            "best_loss": best_loss,
             "target_indices": target_indices, # Store original numpy arrays
             "binder_indices": binder_indices,
-            "best_loss": safe_jax_to_float(best_loss), # Store scalar float
-            "trajectory": trajectory,
             "design_time": time.time() - design_start_time,
-            "final_seq_logits": best_logits,
-            "final_aa_indices": [int(aa) for aa in final_aa_indices], # Convert to Python list
-            # Keep placeholders for compatibility if needed by final prediction
+            "final_aa_indices": [int(aa) for aa in jnp.argmax(jax.nn.softmax(best_logits, axis=-1), axis=-1)], # Convert to Python list
             "best_feature_dict": best_feature_dict, # The dict corresponding to best_logits
             "success": True # Assume success unless specific failure condition met
         }
@@ -259,9 +244,10 @@ class GradientProtocol(BinderProtocol):
 
             # Create a new fold_input with the designed sequence
             new_chains = []
-            binder_chains = self.design_params.get("binder_chains", [])
+            # Access binder chains from the config object
+            binder_chains = self.config.binder_chains
             if not binder_chains:
-                logging.error("Binder chains not specified in design_params. Cannot create new input.")
+                logging.error("Binder chains not specified in config. Cannot create new input.")
                 return {"error": "Missing binder chains"}, {}, fold_input
 
             # Create a mapping of chain ID to the new designed sequence

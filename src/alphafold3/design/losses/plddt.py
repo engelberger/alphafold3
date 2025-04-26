@@ -21,6 +21,9 @@ def get_binder_plddt_loss(
     Returns:
         Negative average pLDDT (to minimize as a loss function).
     """
+    logging.debug(
+        f"get_binder_plddt_loss called with result keys={list(result.keys())}, binder_indices.shape={getattr(binder_indices,'shape',None)}"
+    )
     # Handle different output formats
     plddt = None
     if isinstance(result, dict) and 'predicted_lddt' in result:
@@ -32,6 +35,7 @@ def get_binder_plddt_loss(
 
     # Ensure plddt is a JAX array for consistent operations
     plddt = jnp.asarray(plddt)
+    logging.debug(f"plddt array shape after asarray: {plddt.shape}")
     binder_indices = jnp.asarray(binder_indices)  # Ensure indices are JAX array
 
     # --- Simplified Shape Handling: Assume Rank 3 (samples, residues, atoms) ---
@@ -40,24 +44,28 @@ def get_binder_plddt_loss(
         # Correct indexing: axis 1 for residues
         # binder_indices should be valid for the padded dimension
         binder_plddt_samples_atoms = plddt[:, binder_indices, :]  # Assumes rank 3
+        logging.debug(f"binder_plddt_samples_atoms shape={binder_plddt_samples_atoms.shape}")
 
         # Average over atoms (last axis, -1) and samples (first axis, 0)
         binder_plddt_mean_per_residue = jnp.mean(binder_plddt_samples_atoms, axis=(0, -1))
+        logging.debug(f"binder_plddt_mean_per_residue shape={binder_plddt_mean_per_residue.shape}, values={binder_plddt_mean_per_residue}")
 
     except IndexError as e:
-         # This might occur if plddt has fewer than 3 dimensions
-         logging.error(f"Error indexing pLDDT (shape={plddt.shape}) assuming rank 3: {e}. Returning 0 loss.")
-         return jnp.array(0.0, dtype=jnp.float32)
+        # This might occur if plddt has fewer than 3 dimensions
+        logging.error(f"Error indexing pLDDT (shape={plddt.shape}) assuming rank 3: {e}. Returning 0 loss.")
+        return jnp.array(0.0, dtype=jnp.float32)
     except Exception as e:
-         # Catch other potential errors during calculation
-         logging.error(f"Error calculating binder pLDDT mean (shape={plddt.shape}): {e}. Returning 0 loss.")
-         return jnp.array(0.0, dtype=jnp.float32)
+        # Catch other potential errors during calculation
+        logging.error(f"Error calculating binder pLDDT mean (shape={plddt.shape}): {e}. Returning 0 loss.")
+        return jnp.array(0.0, dtype=jnp.float32)
     # --- End Simplified Shape Handling ---
 
     # Return negative average pLDDT (as we want to maximize pLDDT)
     # Ensure the result is scalar
     # Use nan_to_num for safety before final mean, although mean usually handles NaNs
-    return -jnp.mean(jnp.nan_to_num(binder_plddt_mean_per_residue))
+    loss = -jnp.mean(jnp.nan_to_num(binder_plddt_mean_per_residue))
+    logging.debug(f"get_binder_plddt_loss returning loss: {loss}")
+    return loss
 
 def calculate_plddt_loss(
     result: Dict[str, Any],

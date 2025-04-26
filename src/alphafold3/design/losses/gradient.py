@@ -4,9 +4,11 @@ import jax
 import jax.numpy as jnp
 import logging
 from typing import Dict, Any, Optional, Tuple
+import dataclasses
 
 from alphafold3.design.losses import plddt, pae, distogram, sequence, fape
 from alphafold3.design.losses.common import safe_mean
+from alphafold3.design.config import LossWeightsConfig
 
 logger = logging.getLogger(__name__)
 
@@ -17,11 +19,11 @@ def calculate_gradient_binder_loss(
     target_indices: jnp.ndarray,
     binder_indices: jnp.ndarray,
     binder_seq_logits: jnp.ndarray,
-    design_params: Dict[str, Any],
+    weights_config: LossWeightsConfig,
 ) -> Tuple[jnp.ndarray, Dict[str, Any]]:
     """Calculate loss for gradient-based binder design.
 
-    Combines various loss components based on weights specified in design_params.
+    Combines various loss components based on weights specified in weights_config.
 
     Args:
         result: AlphaFold model result dictionary.
@@ -29,13 +31,18 @@ def calculate_gradient_binder_loss(
         target_indices: Indices of the target residues.
         binder_indices: Indices of the binder residues.
         binder_seq_logits: Sequence logits for the binder.
-        design_params: Dictionary of design parameters (containing weights).
+        weights_config: LossWeightsConfig object containing loss weights.
 
     Returns:
         Tuple of (total_loss, loss_breakdown).
     """
+    logger.debug(
+        f"calculate_gradient_binder_loss called with result keys={list(result.keys())}, "
+        f"feature_dict keys={list(feature_dict.keys())}, binder_seq_logits.shape={getattr(binder_seq_logits, 'shape', None)}, "
+        f"target_indices={getattr(target_indices, 'shape', None)}, binder_indices={getattr(binder_indices, 'shape', None)}, weights_config={weights_config}"
+    )
     losses = {}
-    weights = design_params.get("weights", {}) # Get weights dict
+    weights = dataclasses.asdict(weights_config)
     zero_loss_float32 = jnp.array(0.0, dtype=jnp.float32)
 
     # Ensure indices are JAX arrays
@@ -43,7 +50,8 @@ def calculate_gradient_binder_loss(
     binder_indices_jax = jnp.asarray(binder_indices)
 
     # --- Calculate pLDDT Loss ---
-    plddt_weight = weights.get('plddt', 0.0)
+    plddt_weight = weights_config.gradient_plddt
+    logger.debug(f"plddt_weight={plddt_weight}")
     losses['plddt'] = jax.lax.cond(
         jnp.greater(jnp.asarray(plddt_weight), 0.0),
         lambda op: plddt.get_binder_plddt_loss(op[0], op[1]), # Use lambda with operand tuple
@@ -52,7 +60,8 @@ def calculate_gradient_binder_loss(
     )
 
     # --- Calculate Interface PAE Loss ---
-    pae_inter_weight = weights.get('pae_inter', 0.0)
+    pae_inter_weight = weights_config.gradient_pae_inter
+    logger.debug(f"pae_inter_weight={pae_inter_weight}")
     losses['pae_inter'] = jax.lax.cond(
         jnp.greater(jnp.asarray(pae_inter_weight), 0.0),
         lambda op: pae.get_interface_pae_loss(op[0], op[1], op[2]),
@@ -61,9 +70,9 @@ def calculate_gradient_binder_loss(
     )
 
     # --- Calculate Distogram Entropy Loss (New) ---
-    # Check if required weights exist and are > 0
-    w_intra = weights.get('contact_intra', 0.0)
-    w_inter = weights.get('contact_inter', 0.0)
+    w_intra = weights_config.gradient_contact_intra
+    w_inter = weights_config.gradient_contact_inter
+    logger.debug(f"post-pae, w_intra={w_intra}, w_inter={w_inter}")
     distogram_pred = jnp.greater(jnp.asarray(w_intra) + jnp.asarray(w_inter), 0.0)
 
     def calc_distogram_true(operand):
@@ -101,7 +110,7 @@ def calculate_gradient_binder_loss(
     # Note: total_loss below will add the *already weighted* distogram_loss
 
     # --- Calculate Sequence Entropy Loss ---
-    seq_entropy_weight = weights.get('seq_entropy', 0.0)
+    seq_entropy_weight = weights_config.seq_entropy
     losses['seq_entropy'] = jax.lax.cond(
         jnp.greater(jnp.asarray(seq_entropy_weight), 0.0),
         lambda logits: sequence.get_binder_seq_entropy_loss(logits),
@@ -110,7 +119,7 @@ def calculate_gradient_binder_loss(
     )
 
     # --- Calculate Target FAPE Loss ---
-    fape_target_weight = weights.get('fape_target', 0.0)
+    fape_target_weight = weights_config.gradient_fape_target
     # This condition also depends on feature_dict key presence, handled inside the 'true' function
     def calc_fape_true(operand):
         res, feat_dict, tgt_idx = operand
@@ -156,4 +165,5 @@ def calculate_gradient_binder_loss(
     if 'contact_inter' not in loss_breakdown_unweighted:
         loss_breakdown_unweighted['contact_inter'] = losses['contact_inter']
 
+    logger.debug(f"calculate_gradient_binder_loss final total_loss={total_loss}, breakdown={loss_breakdown_unweighted}")
     return total_loss, loss_breakdown_unweighted 

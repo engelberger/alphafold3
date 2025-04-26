@@ -8,7 +8,7 @@ from unittest.mock import MagicMock
 from alphafold3.design import binder_design
 from alphafold3.design import binder_utils
 from alphafold3.common import folding_input
-
+from alphafold3.design.config import DesignConfig
 
 @pytest.fixture
 def dummy_fold_input():
@@ -79,21 +79,21 @@ def mock_model_runner():
 def test_binder_designer_gradient_smoke(dummy_fold_input, dummy_feature_dict_design, mock_model_runner):
     """A smoke test to ensure the gradient design pipeline runs without crashing."""
     
-    design_params = {
-        "protocol": "binder_gradient",
-        "target_chains": ["A"], # From dummy_fold_input
-        "binder_chains": ["B"], # From dummy_fold_input
-        "lr": 0.1,
-        "steps": 2, # Keep low for speed
-        "weights": {
+    design_config = DesignConfig(
+        protocol_name="binder_gradient",
+        target_chains=["A"], # From dummy_fold_input
+        binder_chains=["B"], # From dummy_fold_input
+        learning_rate=0.1,
+        steps=2, # Keep low for speed
+        weights={
             "plddt": 0.1,
             "pae_inter": 0.1,
             "contact_intra": 0.0, # Disable complex losses for simplicity
             "contact_inter": 0.0,
             "seq_entropy": 0.01
         },
-        "clear_memory_interval": 0 # Disable memory clearing
-    }
+            clear_memory_interval=0 # Disable memory clearing
+    )
     
     # Mock CCD (not strictly needed if features are provided, but good practice)
     mock_ccd = MagicMock()
@@ -101,7 +101,7 @@ def test_binder_designer_gradient_smoke(dummy_fold_input, dummy_feature_dict_des
     designer = binder_design.BinderDesigner(
         model_runner=mock_model_runner,
         ccd=mock_ccd,
-        design_params=design_params
+        design_config=design_config
     )
 
     rng_key = jax.random.PRNGKey(0)
@@ -122,12 +122,12 @@ def test_binder_designer_gradient_smoke(dummy_fold_input, dummy_feature_dict_des
     assert design_results["protocol"] == "binder_gradient"
     assert "best_loss" in design_results
     assert "trajectory" in design_results
-    assert len(design_results["trajectory"]["loss"]) == design_params["steps"]
+    assert len(design_results["trajectory"]["loss"]) == design_config.steps
     assert len(design_results["trajectory"]["sequences"]) > 0 # Should generate sequences
     assert isinstance(final_feature_dict, dict)
 
     # Check that the mock runner was called
-    assert mock_model_runner.run_inference.call_count == design_params["steps"]
+    assert mock_model_runner.run_inference.call_count == design_config.steps
 
 # Placeholder for Boltz baseline test (more complex to mock)
 # @pytest.mark.baseline

@@ -35,6 +35,8 @@ import time
 import typing
 from typing import overload, Optional, Dict, Any
 import copy
+import json
+import subprocess
 
 from absl import app
 from absl import flags
@@ -58,6 +60,7 @@ import numpy as np
 from alphafold3.data.custom_utils import parse_mutation_string, apply_mutations_to_input, parse_masking_positions, apply_masking_to_features
 from alphafold3.model import data_constants
 from alphafold3.design import binder_design
+from alphafold3.design.config import DesignConfig, BoltzDesignConfig, GradientDesignConfig, LossWeightsConfig
 
 _HOME_DIR = pathlib.Path(os.environ.get('HOME'))
 _DEFAULT_MODEL_DIR = _HOME_DIR / 'models'
@@ -300,7 +303,7 @@ _DESIGN_STEPS = flags.DEFINE_integer(
     'design_steps', 200, 'Total optimization steps (used if protocol has one stage).'
 )
 _DESIGN_SEQ_ENTROPY_WEIGHT = flags.DEFINE_float(
-    'design_seq_entropy_weight', 0.01, 'Weight for sequence entropy loss.'
+    'design_seq_entropy_weight', 0.00, 'Weight for sequence entropy loss.'
 )
 
 _CLEAR_MEMORY_INTERVAL = flags.DEFINE_integer(
@@ -336,13 +339,13 @@ _BOLTZ_STAGE4_STEPS = flags.DEFINE_integer(
     'boltz_stage4_steps', 50, 'Steps for BoltzDesign1 Stage 4 (one-hot).'
 )
 _BOLTZ_CONTACT_INTRA_WEIGHT = flags.DEFINE_float(
-    'boltz_contact_intra_weight', 1.0, 'Weight for intra-binder distogram entropy loss (Boltz protocol).'
+    'boltz_contact_intra_weight', 0.5, 'Weight for intra-binder distogram entropy loss (Boltz protocol).'
 )
 _BOLTZ_CONTACT_INTER_WEIGHT = flags.DEFINE_float(
-    'boltz_contact_inter_weight', 1.0, 'Weight for inter-face distogram entropy loss (Boltz protocol).'
+    'boltz_contact_inter_weight', 0.5, 'Weight for inter-face distogram entropy loss (Boltz protocol).'
 )
 _BOLTZ_CONFIDENCE_WEIGHT = flags.DEFINE_float(
-    'boltz_confidence_weight', 0.5, 'Weight for confidence loss (pLDDT/PAE) (Boltz protocol).'
+    'boltz_confidence_weight', 1.0, 'Weight for confidence loss (pLDDT/PAE) (Boltz protocol).'
 )
 
 # Output controls.
@@ -388,7 +391,7 @@ flags.DEFINE_enum('mask_token', 'X', _VALID_MASK_TOKENS,
 # --- Logging and Metrics ---
 _LOG_LEVEL = flags.DEFINE_string(
     'log_level',
-    'INFO',
+    'DEBUG',
     'Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL)',
 )
 _LOG_FORMAT = flags.DEFINE_enum(
@@ -441,6 +444,32 @@ flags.DEFINE_integer(
     'single seed.',
 )
 # --------------------
+
+def _get_version_or_git_sha() -> str:
+    """Tries to get the package version or git SHA."""
+    try:
+        # Try getting package version first (if installed)
+        import importlib.metadata
+        return importlib.metadata.version('alphafold3')
+    except importlib.metadata.PackageNotFoundError:
+        # Fallback to git SHA
+        try:
+            # Assumes script is run from within the repo or a subdirectory
+            repo_dir = pathlib.Path(__file__).parent.parent # Go up two levels from /app/alphafold/ to /app/
+            # Check if .git directory exists
+            if (repo_dir / '.git').is_dir():
+                git_sha = subprocess.check_output(
+                    ['git', 'rev-parse', 'HEAD'],
+                    cwd=repo_dir, stderr=subprocess.DEVNULL
+                ).strip().decode()
+                return f"git:{git_sha[:7]}"
+            else:
+                return "unknown (not a git repo)"
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            return "unknown (git failed)"
+    except Exception as e:
+        logging.warning(f"Error getting version info: {e}")
+        return "unknown (error)"
 
 def make_model_config(
     *,
@@ -550,8 +579,10 @@ class ModelRunner:
     # by the confidence head (if confidence is calculated separately).
     # A more refined approach might require modifying the ModelRunner or Model itself.
     if mode == "boltz_design":
-        logging.debug("Applying stop_gradient to the full result in boltz_design mode (Coarse Implementation)")
-        result = jax.lax.stop_gradient(result)
+        logging.debug("BoltzDesign1 mode: NOT applying global stop_gradient (fixed implementation)")
+        # The line below is commented out to allow gradient flow from confidence losses
+        # result = jax.lax.stop_gradient(result)
+        pass  # Model.__call__ already applies stop_gradient to atom_positions only
 
     # Skip NumPy conversion when in boltz_design mode to avoid TracerArrayConversionError
     # This is needed because boltz_design mode runs within a JAX JIT context
@@ -777,7 +808,7 @@ def process_fold_input(
     output_dir: os.PathLike[str] | str,
     mutations_str: Optional[str],
     masking_config: Dict[str, Any],
-    design_params: Optional[Dict[str, Any]] = None,
+    design_config: Optional[DesignConfig] = None,
     buckets: Sequence[int] | None = None,
     ref_max_modified_date: datetime.date | None = None,
     conformer_max_iterations: int | None = None,
@@ -794,7 +825,7 @@ def process_fold_input(
     output_dir: os.PathLike[str] | str,
     mutations_str: Optional[str],
     masking_config: Dict[str, Any],
-    design_params: Optional[Dict[str, Any]] = None,
+    design_config: Optional[DesignConfig] = None,
     buckets: Sequence[int] | None = None,
     ref_max_modified_date: datetime.date | None = None,
     conformer_max_iterations: int | None = None,
@@ -810,7 +841,7 @@ def process_fold_input(
     output_dir: os.PathLike[str] | str,
     mutations_str: Optional[str],
     masking_config: Dict[str, Any],
-    design_params: Optional[Dict[str, Any]] = None,
+    design_config: Optional[DesignConfig] = None,
     buckets: Sequence[int] | None = None,
     ref_max_modified_date: datetime.date | None = None,
     conformer_max_iterations: int | None = None,
@@ -826,7 +857,7 @@ def process_fold_input(
     output_dir: Output directory to write to.
     mutations_str: Optional string defining mutations to apply.
     masking_config: Dictionary with masking parameters.
-    design_params: Optional dictionary with design parameters.
+    design_config: Optional DesignConfig object with design parameters.
     buckets: Bucket sizes to pad the data to, to avoid excessive re-compilation
       of the model. If None, calculate the appropriate bucket size from the
       number of tokens. If not None, must be a sequence of at least one integer,
@@ -898,11 +929,11 @@ def process_fold_input(
     logging.info("Skipping model inference as model_runner is None.")
     output = fold_input
   else:
-    # Check if we're running a binder design protocol
-    if design_params is not None and design_params.get("protocol") in ["binder_gradient", "binder_boltz"]:
-      print(f'Designing binder for {fold_input.name} using {design_params["protocol"]} protocol...')
-      logging.info(f"Starting binder design for {fold_input.name} with protocol {design_params['protocol']}")
-      
+    # Check if we're running a binder design protocol (using DesignConfig)
+    if design_config is not None and design_config.protocol_name in [DesignProtocol.BINDER_GRADIENT.value, DesignProtocol.BINDER_BOLTZ.value]:
+      print(f'Designing binder for {fold_input.name} using {design_config.protocol_name} protocol...')
+      logging.info(f"Starting binder design for {fold_input.name} with protocol {design_config.protocol_name}")
+
       # Get CCD
       ccd = chemical_components.cached_ccd(user_ccd=fold_input.user_ccd)
       
@@ -938,7 +969,7 @@ def process_fold_input(
             feature_dict=initial_feature_dict,
             model_runner=model_runner,
             ccd=ccd,
-            design_params=design_params,
+            design_config=design_config,
             rng_seed=design_seed,
             buckets=buckets,
             ref_max_modified_date=ref_max_modified_date,
@@ -974,8 +1005,8 @@ def process_fold_input(
         # Save the design results (trajectory, losses etc.) as JSON, specific to the seed
         import json
         # Use the potentially modified name from new_fold_input
-        sanitised_name = new_fold_input.sanitised_name() 
-        design_output_path = os.path.join(output_dir, f'{sanitised_name}_seed_{design_seed}_design_results.json')
+        sanitised_name = new_fold_input.sanitised_name()
+        design_output_path = os.path.join(output_dir, f'{sanitised_name}_seed_{design_seed}_{design_config.protocol_name}_design_results.json')
         with open(design_output_path, 'w') as f:
             # Convert arrays to lists for JSON serialization
             json_safe_results = {}
@@ -1004,7 +1035,8 @@ def process_fold_input(
             
             # Add the final designed sequence explicitly for easy access
             # Need to find binder chain indices and sequences dynamically
-            binder_chain_ids = design_params.get('binder_chains', [])
+            # Access chains directly from the DesignConfig object
+            binder_chain_ids = design_config.binder_chains
             
             # Store all designed sequences with chain IDs as keys
             designed_sequences = {}
@@ -1310,44 +1342,66 @@ def main(_):
   # ----------------------------
 
   # --- Prepare Design Parameters ---
-  design_params = None
+  # Build centralized DesignConfig from flags
+  design_config = None
   if FLAGS.protocol in [DesignProtocol.BINDER_GRADIENT, DesignProtocol.BINDER_BOLTZ]:
     if not FLAGS.target_chains:
       raise app.UsageError("--target_chains required for binder protocols.")
     if not FLAGS.binder_chains:
       raise app.UsageError("--binder_chains required for binder protocols.")
 
-    design_params = {
-        "protocol": FLAGS.protocol.value,
-        "target_chains": FLAGS.target_chains,
-        "binder_chains": FLAGS.binder_chains,
-        "lr": FLAGS.design_learning_rate,
-        "weights": {"seq_entropy": FLAGS.design_seq_entropy_weight}
-    }
+    # 1. Create weights config, overriding defaults from flags
+    # Defaults are defined in LossWeightsConfig, only override specified flags
+    weights_cfg = LossWeightsConfig(
+        seq_entropy=FLAGS.design_seq_entropy_weight,
+        gradient_plddt=FLAGS.gradient_plddt_weight,
+        gradient_pae_inter=FLAGS.gradient_pae_inter_weight,
+        gradient_contact_inter=FLAGS.gradient_contact_weight,
+        # Note: gradient_contact_intra defaults to 0.0 in config
+        boltz_contact_intra=FLAGS.boltz_contact_intra_weight,
+        boltz_contact_inter=FLAGS.boltz_contact_inter_weight,
+        boltz_confidence=FLAGS.boltz_confidence_weight
+        # Note: gradient_fape_target and boltz_helix use defaults (0.0)
+    )
+
+    # 2. Create protocol-specific subconfig
+    boltz_cfg = None
+    gradient_cfg = None
 
     if FLAGS.protocol == DesignProtocol.BINDER_GRADIENT:
-        logging.info(f"Running Gradient Binder Design: Target={FLAGS.target_chains}, Binder={FLAGS.binder_chains}")
-        design_params["steps"] = FLAGS.design_steps
-        design_params["weights"].update({
-            "plddt": FLAGS.gradient_plddt_weight,
-            "pae_inter": FLAGS.gradient_pae_inter_weight,
-            "contact": FLAGS.gradient_contact_weight,
-        })
+      logging.info(f"Running Gradient Binder Design: Target={FLAGS.target_chains}, Binder={FLAGS.binder_chains}")
+      gradient_cfg = GradientDesignConfig(
+          steps=FLAGS.design_steps,
+          weights=weights_cfg
+      )
     elif FLAGS.protocol == DesignProtocol.BINDER_BOLTZ:
-        logging.info(f"Running BoltzDesign1 Binder Protocol: Target={FLAGS.target_chains}, Binder={FLAGS.binder_chains}")
-        design_params["stages"] = [
+      logging.info(f"Running BoltzDesign1 Binder Protocol: Target={FLAGS.target_chains}, Binder={FLAGS.binder_chains}")
+      boltz_cfg = BoltzDesignConfig(
+          stages=[
             FLAGS.boltz_stage1_steps,
             FLAGS.boltz_stage2_steps,
             FLAGS.boltz_stage3_steps,
             FLAGS.boltz_stage4_steps
-        ]
-        design_params["weights"].update({
-            "contact_intra": FLAGS.boltz_contact_intra_weight,
-            "contact_inter": FLAGS.boltz_contact_inter_weight,
-            "confidence": FLAGS.boltz_confidence_weight,
-        })
-        # Add clear_memory_interval to enable memory optimization
-        design_params["clear_memory_interval"] = FLAGS.clear_memory_interval
+          ],
+          # Note: random_init_scale uses default (0.01) from config
+          weights=weights_cfg
+      )
+
+    # 3. Instantiate top-level config
+    # Use defaults from DesignConfig for verbosity, best_metric, traj_max
+    design_config = DesignConfig(
+        protocol_name=FLAGS.protocol.value,
+        learning_rate=FLAGS.design_learning_rate,
+        clear_memory_interval=FLAGS.clear_memory_interval,
+        # verbosity=1, # Uses default from dataclass
+        # best_metric="loss", # Uses default from dataclass
+        # traj_max=10, # Uses default from dataclass
+        target_chains=FLAGS.target_chains,
+        binder_chains=FLAGS.binder_chains,
+        boltz_config=boltz_cfg,
+        gradient_config=gradient_cfg,
+    )
+
   else:
     logging.info("Running standard folding protocol.")
   # ---------------------------
@@ -1374,66 +1428,120 @@ def main(_):
   # --- Process Each Input ---
   num_fold_inputs_processed = 0
   total_start_time = time.time()
+
+  # --- Log and Save Final Configuration --- >
+  # Gather all configuration pieces
+  final_run_config = {}
+  try:
+      final_run_config["af3_version"] = _get_version_or_git_sha()
+      final_run_config["timestamp"] = datetime.datetime.now().isoformat(timespec="seconds")
+      # Convert flags to a simple dict
+      flags_dict = {}
+      for flag_name in FLAGS:
+          flags_dict[flag_name] = FLAGS[flag_name].value
+      final_run_config["flags"] = flags_dict
+
+      if design_config:
+          # Use dataclasses.asdict for recursive conversion
+          final_run_config["design_config"] = dataclasses.asdict(design_config)
+      else:
+          final_run_config["design_config"] = None
+
+      # Get model config (assuming model_runner exists if inference is run)
+      if model_runner:
+          # Create a temporary model config instance to serialize
+          temp_model_config = make_model_config(
+              flash_attention_implementation=typing.cast(
+                  attention.Implementation, _FLASH_ATTENTION_IMPLEMENTATION.value
+              ),
+              num_diffusion_samples=_NUM_DIFFUSION_SAMPLES.value,
+              num_recycles=_NUM_RECYCLES.value,
+              return_embeddings=_SAVE_EMBEDDINGS.value,
+          )
+          # Convert the Haiku config to a dict
+          final_run_config["model_config"] = temp_model_config.as_dict()
+          final_run_config["device"] = str(target_device_for_runner)
+      else:
+          final_run_config["model_config"] = None
+          final_run_config["device"] = "N/A (Inference Disabled)"
+
+      # Prepare JSON representation for logging
+      json_indent = 2 if _LOG_FORMAT.value == 'pretty' else None
+      json_separators = (",", ":") if _LOG_FORMAT.value == 'json' else None
+      config_log_str = json.dumps(final_run_config, indent=json_indent, sort_keys=True, separators=json_separators, default=str)
+
+      logging.info(f"FINAL RUN CONFIGURATION:\n{config_log_str}")
+
+      # Save the configuration to a file in the main output directory
+      config_file_path = os.path.join(_OUTPUT_DIR.value, "run_config.json")
+      with open(config_file_path, "w") as f:
+          json.dump(final_run_config, f, indent=2, sort_keys=True, default=str)
+      logging.info(f"Saved final run configuration to {config_file_path}")
+
+  except Exception as e:
+      logging.error(f"Failed to log or save final run configuration: {e}", exc_info=True)
+  # <--- End Log and Save Final Configuration ---
+
   for fold_input_item in fold_inputs:
-    job_start_time = time.time()
-    if _NUM_SEEDS.value is not None:
-      logging.info(f'Expanding fold job {fold_input_item.name} to {_NUM_SEEDS.value} seeds')
-      fold_input_item = fold_input_item.with_multiple_seeds(_NUM_SEEDS.value)
+      job_start_time = time.time()
+      if _NUM_SEEDS.value is not None:
+          logging.info(f'Expanding fold job {fold_input_item.name} to {_NUM_SEEDS.value} seeds')
+          fold_input_item = fold_input_item.with_multiple_seeds(_NUM_SEEDS.value)
 
-    # Define output directory for this specific job
-    job_output_dir = os.path.join(_OUTPUT_DIR.value, fold_input_item.sanitised_name())
+      # Define output directory for this specific job
+      job_output_dir = os.path.join(_OUTPUT_DIR.value, fold_input_item.sanitised_name())
 
-    # --- Override binder length if flag is set ---
-    if FLAGS.binder_length is not None:
-        if not FLAGS.binder_chains:
-            raise ValueError("--binder_length requires --binder_chains to be set.")
-        logging.info(f"Overriding binder length to {FLAGS.binder_length} for chains {FLAGS.binder_chains}")
-        new_chains = []
-        binder_chain_ids_to_modify = set(FLAGS.binder_chains)
-        for chain in fold_input_item.chains:
-            if chain.id in binder_chain_ids_to_modify and isinstance(chain, folding_input.ProteinChain):
-                logging.info(f"Modifying length of binder chain {chain.id} to {FLAGS.binder_length}")
-                new_sequence = 'A' * FLAGS.binder_length
-                # Create a new chain with the overridden sequence and explicitly empty MSA/templates
-                modified_chain = folding_input.ProteinChain(
-                    id=chain.id,
-                    sequence=new_sequence,
-                    ptms=[], # Reset PTMs for new sequence
-                    unpaired_msa="", # Explicitly empty to skip pipeline
-                    paired_msa="",   # Explicitly empty to skip pipeline
-                    templates=[]     # Explicitly empty to skip pipeline
-                )
-                new_chains.append(modified_chain)
-            else:
-                new_chains.append(chain)
-        # Replace chains in the input object (dataclasses are immutable, need replace)
-        fold_input_item = dataclasses.replace(fold_input_item, chains=tuple(new_chains))
-    # --------------------------------------------
+      # --- Override binder length if flag is set ---
+      if FLAGS.binder_length is not None:
+          if not FLAGS.binder_chains:
+              raise ValueError("--binder_length requires --binder_chains to be set.")
+          logging.info(f"Overriding binder length to {FLAGS.binder_length} for chains {FLAGS.binder_chains}")
+          new_chains = []
+          binder_chain_ids_to_modify = set(FLAGS.binder_chains)
+          for chain in fold_input_item.chains:
+              if chain.id in binder_chain_ids_to_modify and isinstance(chain, folding_input.ProteinChain):
+                  logging.info(f"Modifying length of binder chain {chain.id} to {FLAGS.binder_length}")
+                  new_sequence = 'A' * FLAGS.binder_length
+                  # Create a new chain with the overridden sequence and explicitly empty MSA/templates
+                  modified_chain = folding_input.ProteinChain(
+                      id=chain.id,
+                      sequence=new_sequence,
+                      ptms=[], # Reset PTMs for new sequence
+                      unpaired_msa="", # Explicitly empty to skip pipeline
+                      paired_msa="",   # Explicitly empty to skip pipeline
+                      templates=[]     # Explicitly empty to skip pipeline
+                  )
+                  new_chains.append(modified_chain)
+              else:
+                  new_chains.append(chain)
+          # Replace chains in the input object (dataclasses are immutable, need replace)
+          fold_input_item = dataclasses.replace(fold_input_item, chains=tuple(new_chains))
+      # --------------------------------------------
 
-    # --- Override seed if flag is set ---
-    if FLAGS.seed is not None:
-        logging.info(f"Overriding random seeds with single seed: {FLAGS.seed}")
-        fold_input_item = dataclasses.replace(fold_input_item, rng_seeds=(FLAGS.seed,))
-    # ----------------------------------
+      # --- Override seed if flag is set ---
+      if FLAGS.seed is not None:
+          logging.info(f"Overriding random seeds with single seed: {FLAGS.seed}")
+          fold_input_item = dataclasses.replace(fold_input_item, rng_seeds=(FLAGS.seed,))
+      # ----------------------------------
 
-    process_fold_input(
-        fold_input=fold_input_item,
-        data_pipeline_config=data_pipeline_config,
-        model_runner=model_runner,
-        output_dir=job_output_dir,
-        # --- Pass mutation/masking args ---
-        mutations_str=FLAGS.mutations,
-        masking_config=masking_config,
-        # --- Pass design params ---
-        design_params=design_params,
-        # ----------------------------------
-        buckets=tuple(int(bucket) for bucket in _BUCKETS.value),
-        ref_max_modified_date=max_template_date,
-        conformer_max_iterations=_CONFORMER_MAX_ITERATIONS.value,
-        force_output_dir=_FORCE_OUTPUT_DIR.value,
-    )
-    num_fold_inputs_processed += 1
-    logging.info(f"Finished processing job {fold_input_item.name} in {time.time() - job_start_time:.2f} seconds.")
+      process_fold_input(
+          fold_input=fold_input_item,
+          data_pipeline_config=data_pipeline_config,
+          model_runner=model_runner,
+          output_dir=job_output_dir,
+          # --- Pass mutation/masking args ---
+          mutations_str=FLAGS.mutations,
+          masking_config=masking_config,
+          # --- Pass design params (now DesignConfig object) ---
+          design_config=design_config,
+          # ----------------------------------
+          buckets=tuple(int(bucket) for bucket in _BUCKETS.value),
+          ref_max_modified_date=max_template_date,
+          conformer_max_iterations=_CONFORMER_MAX_ITERATIONS.value,
+          force_output_dir=_FORCE_OUTPUT_DIR.value,
+      )
+      num_fold_inputs_processed += 1
+      logging.info(f"Finished processing job {fold_input_item.name} in {time.time() - job_start_time:.2f} seconds.")
 
   total_time = time.time() - total_start_time
   print(f'\nDone running {num_fold_inputs_processed} fold job(s) in {total_time:.2f} seconds.')

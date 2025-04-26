@@ -13,18 +13,23 @@ from alphafold3.common import folding_input
 from alphafold3.constants import chemical_components
 from alphafold3.model import model
 from alphafold3.model import features
+from alphafold3.design.config import DesignConfig
 from alphafold3.design import binder_utils
 
 
 class BinderProtocol(abc.ABC):
     """Abstract base class for all binder design protocols."""
 
-    def __init__(self, model_runner: Any, ccd: chemical_components.Ccd, design_params: Dict[str, Any]):
+    def __init__(self, model_runner: Any, ccd: chemical_components.Ccd, design_config: 'DesignConfig'):
+        """Initialize protocol with a structured DesignConfig."""
         self.model_runner = model_runner
         self.ccd = ccd
-        self.design_params = design_params
-        self.protocol = design_params.get("protocol", "unknown")
-        self.clear_memory_interval = design_params.get("clear_memory_interval", 0)
+        # Store full config
+        self.config = design_config
+        # Protocol name from config
+        self.protocol = self.config.protocol_name
+        # Clear memory interval from config
+        self.clear_memory_interval = self.config.clear_memory_interval
 
     @abc.abstractmethod
     def design(
@@ -114,9 +119,10 @@ class BinderProtocol(abc.ABC):
 
         # Create a new fold_input with the designed sequence
         new_chains = []
-        binder_chains = self.design_params.get("binder_chains", [])
+        # Binder chains from structured config
+        binder_chains = self.config.binder_chains
         if not binder_chains:
-            logging.error("Binder chains not specified in design_params. Cannot create new input.")
+            logging.error("Binder chains not specified in config. Cannot create new input.")
             return {}, {}, fold_input
 
         # Create a mapping of chain ID to the new designed sequence
@@ -139,7 +145,7 @@ class BinderProtocol(abc.ABC):
                 binder_seq_by_chain[binder_chain_id] = designed_sequence[binder_start_idx:binder_start_idx + chain_length]
                 binder_start_idx += chain_length
             else:
-                logging.warning(f"Binder chain ID {binder_chain_id} specified in design_params not found in original input chains.")
+                logging.warning(f"Binder chain ID {binder_chain_id} specified in config not found in original input chains.")
 
         # Create new chains with updated sequences where needed
         for chain in fold_input.chains:

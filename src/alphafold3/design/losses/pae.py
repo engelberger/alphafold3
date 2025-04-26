@@ -8,6 +8,7 @@ in the predicted positions between pairs of residues.
 import jax
 import jax.numpy as jnp
 import logging
+logger = logging.getLogger(__name__)
 from typing import Dict, List, Optional, Tuple, Union, Any
 
 from alphafold3.design.losses import common
@@ -81,6 +82,9 @@ def get_interface_pae_loss(result, target_indices, binder_indices):
     Returns:
         Average PAE at the interface (target-binder interactions).
     """
+    logger.debug(
+        f"get_interface_pae_loss called with keys={list(result.keys())}, target_indices.shape={getattr(target_indices,'shape',None)}, binder_indices.shape={getattr(binder_indices,'shape',None)}"
+    )
     # Extract and process PAE matrix
     pae = get_pae_matrix(result)
     if pae is None:
@@ -108,6 +112,7 @@ def get_interface_pae_loss(result, target_indices, binder_indices):
         pae_processed
     )
 
+    logger.debug(f"get_interface_pae_loss returning loss: {pae_loss}")
     return pae_loss
 
 
@@ -168,6 +173,9 @@ def calculate_pae_loss(
     Returns:
         PAE-based loss value
     """
+    logger.debug(
+        f"calculate_pae_loss called with result keys={list(result.keys())}, binder_indices={binder_indices}, target_indices={target_indices}, interface_only={interface_only}, scale={scale}"
+    )
     if "predicted_aligned_error" not in result:
         raise ValueError("No predicted_aligned_error in result dict")
     
@@ -182,6 +190,7 @@ def calculate_pae_loss(
     # Loss is mean PAE (we want to minimize PAE)
     loss = common.safe_mean(pae_masked) * scale
     
+    logger.debug(f"calculate_pae_loss returning loss: {loss}")
     return loss
 
 def calculate_pae_confidence_loss(
@@ -201,6 +210,9 @@ def calculate_pae_confidence_loss(
     Returns:
         PAE confidence-based loss value
     """
+    logger.debug(
+        f"calculate_pae_confidence_loss called with result keys={list(result.keys())}, binder_indices={binder_indices}, target_indices={target_indices}, confidence_threshold={confidence_threshold}"
+    )
     if "predicted_aligned_error" not in result or "predicted_aligned_error_confidence" not in result:
         raise ValueError("Missing predicted_aligned_error or predicted_aligned_error_confidence in result dict")
     
@@ -218,6 +230,7 @@ def calculate_pae_confidence_loss(
     # Loss is mean PAE for high-confidence predictions
     loss = common.safe_mean(high_conf_pae)
     
+    logger.debug(f"calculate_pae_confidence_loss returning loss: {loss}")
     return loss
 
 def calculate_max_interface_pae_loss(
@@ -237,6 +250,9 @@ def calculate_max_interface_pae_loss(
     Returns:
         PAE percentile-based loss value
     """
+    logger.debug(
+        f"calculate_max_interface_pae_loss called with result keys={list(result.keys())}, binder_indices={binder_indices}, target_indices={target_indices}, percentile={percentile}"
+    )
     if "predicted_aligned_error" not in result:
         raise ValueError("No predicted_aligned_error in result dict")
     
@@ -274,4 +290,5 @@ def calculate_max_interface_pae_loss(
         flat_pae
     )
 
+    logger.debug(f"calculate_max_interface_pae_loss returning loss: {loss}")
     return loss 

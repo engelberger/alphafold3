@@ -4,8 +4,11 @@ import jax
 import jax.numpy as jnp
 import functools
 from typing import Dict, Any, Optional, Tuple
+import logging
 
 from alphafold3.design.losses.common import entropy_low_bins, safe_mean
+
+logger = logging.getLogger(__name__)
 
 # Moved from binder_loss.py
 def get_distogram_entropy_loss(
@@ -24,6 +27,9 @@ def get_distogram_entropy_loss(
         Combined weighted distogram entropy loss (scalar JAX array).
         Dictionary containing unweighted 'contact_intra' and 'contact_inter' losses.
     """
+    logger.debug(
+        f"get_distogram_entropy_loss called with distogram_logits.shape={getattr(distogram_logits, 'shape', None)}, bin_breaks.shape={getattr(bin_breaks, 'shape', None)}, target_indices={getattr(target_indices, 'shape', None)}, binder_indices={getattr(binder_indices, 'shape', None)}, weights={weights}"
+    )
     # Ensure inputs are JAX arrays
     distogram_logits = jnp.asarray(distogram_logits)
     bin_breaks = jnp.asarray(bin_breaks)
@@ -38,7 +44,9 @@ def get_distogram_entropy_loss(
 
     # Create masks based on cutoffs
     low_bin_mask_14 = (bin_tops <= 14.0) # Intra-binder cutoff
+    logger.debug(f"low_bin_mask_14 sum={jnp.sum(low_bin_mask_14)}")
     low_bin_mask_22 = (bin_tops <= 22.0) # Inter-interface cutoff
+    logger.debug(f"low_bin_mask_22 sum={jnp.sum(low_bin_mask_22)}")
 
     # Create partial functions for entropy calculation with specific masks
     ent_intra_fn = functools.partial(entropy_low_bins, low_mask=low_bin_mask_14)
@@ -49,13 +57,16 @@ def get_distogram_entropy_loss(
     # We could optimize by slicing logits first, but this is simpler for now.
     # Assuming logits shape (R, R, 64)
     intra_pair_entropy = ent_intra_fn(distogram_logits) # Shape (R, R)
+    logger.debug(f"intra_pair_entropy shape={intra_pair_entropy.shape}, sample={intra_pair_entropy.flatten()[:5]}")
     inter_pair_entropy = ent_inter_fn(distogram_logits) # Shape (R, R)
+    logger.debug(f"inter_pair_entropy shape={inter_pair_entropy.shape}, sample={inter_pair_entropy.flatten()[:5]}")
 
     # --- Residue-level aggregation ---
 
     # Intra-binder loss (k=2, |i-j|>=9)
     intra_loss = zero_loss_float32
     w_intra = jnp.asarray(weights.get('contact_intra', 0.0)) # Get weight
+    logger.debug(f"w_intra={w_intra}")
 
     def calc_intra_loss():
         # Select intra-binder pairs
@@ -97,7 +108,9 @@ def get_distogram_entropy_loss(
 
         # Final intra-loss: mean over all binder residues (l = num_binder)
         # Use nan_to_num for safety, though mean should handle empty cases if num_binder > 0
-        return jnp.mean(jnp.nan_to_num(per_res_intra_mean_k))
+        intra_loss = jnp.mean(jnp.nan_to_num(per_res_intra_mean_k))
+        logger.debug(f"intra_loss unweighted={intra_loss}")
+        return intra_loss
 
     # Conditionally calculate intra loss based on weight and num_binder
     intra_loss = jax.lax.cond(
@@ -110,6 +123,7 @@ def get_distogram_entropy_loss(
     # Inter-face loss (k=1)
     inter_loss = zero_loss_float32
     w_inter = jnp.asarray(weights.get('contact_inter', 0.0)) # Get weight
+    logger.debug(f"w_inter={w_inter}")
 
     def calc_inter_loss():
         # Select inter-face pairs (binder-target)
@@ -125,8 +139,9 @@ def get_distogram_entropy_loss(
         per_res_inter_finite = jnp.where(jnp.isfinite(per_res_inter_min), per_res_inter_min, 0.0)
         finite_count = jnp.sum(jnp.isfinite(per_res_inter_min))
         # Avoid division by zero if no finite values exist
-        mean_inter_loss = jnp.where(finite_count > 0, jnp.sum(per_res_inter_finite) / finite_count, 0.0)
-        return mean_inter_loss
+        inter_loss_val = jnp.where(finite_count > 0, jnp.sum(per_res_inter_finite) / finite_count, 0.0)
+        logger.debug(f"inter_loss_val unweighted={inter_loss_val}")
+        return inter_loss_val
 
     # Conditionally calculate inter loss based on weight and num_binder/num_target
     num_target = target_indices.shape[0]
@@ -139,7 +154,8 @@ def get_distogram_entropy_loss(
 
     # --- Combine weighted losses ---
     total_distogram_loss = w_intra * intra_loss + w_inter * inter_loss
+    logger.debug(f"total_distogram_loss weighted={total_distogram_loss}, breakdown={{'contact_intra': intra_loss, 'contact_inter': inter_loss_val}}")
 
     # Return breakdown (unweighted individual losses) and total weighted loss
-    loss_breakdown = {'contact_intra': intra_loss, 'contact_inter': inter_loss}
+    loss_breakdown = {'contact_intra': intra_loss, 'contact_inter': inter_loss_val}
     return total_distogram_loss, loss_breakdown 

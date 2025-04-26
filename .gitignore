@@ -18,3 +18,4 @@ src/alphafold3/constants/converters/chemical_component_sets.pickle
 .devcontainer/devcontainer.json
 .devcontainer/README.md
 docker/dev/Dockerfile.dev
+src/alphafold3/design/binder_design.old.py

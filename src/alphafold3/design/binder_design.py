@@ -46,6 +46,7 @@ from alphafold3.design.losses import (
 )
 # Import protocols
 from alphafold3.design.protocols import BinderProtocol, GradientProtocol, BoltzProtocol
+from alphafold3.design.config import DesignConfig
 from alphafold3.design import plotting
 
 def freeze_containers_for_jax(obj):
@@ -77,30 +78,31 @@ class BinderDesigner:
         self,
         model_runner: Any,
         ccd: chemical_components.Ccd,
-        design_params: Dict[str, Any],
+        design_config: DesignConfig,
     ):
-        """Initialize the binder designer factory.
+        """Initialize the binder designer factory with a DesignConfig.
         
         Args:
             model_runner: ModelRunner instance.
             ccd: Chemical component dictionary.
-            design_params: Dictionary of design parameters including 'protocol'.
+            design_config: Structured design configuration.
         """
         self.model_runner = model_runner
         self.ccd = ccd
-        self.design_params = design_params
-        self.protocol_name = design_params.get("protocol", "binder_gradient")
+        self.config = design_config
+        # Use protocol_name from config
+        self.protocol_name = self.config.protocol_name
         self.protocol_instance = self._create_protocol()
 
         logging.info(f"Initialized BinderDesigner with protocol: {self.protocol_name}")
-        logging.debug(f"Design parameters: {design_params}")
+        logging.debug(f"Design config: {self.config}")
 
     def _create_protocol(self) -> BinderProtocol:
-        """Instantiates the correct protocol based on design_params."""
+        """Instantiates the correct protocol based on design_config."""
         if self.protocol_name == "binder_gradient":
-            return GradientProtocol(self.model_runner, self.ccd, self.design_params)
+            return GradientProtocol(self.model_runner, self.ccd, self.config)
         elif self.protocol_name == "binder_boltz":
-            return BoltzProtocol(self.model_runner, self.ccd, self.design_params)
+            return BoltzProtocol(self.model_runner, self.ccd, self.config)
         else:
             raise ValueError(f"Unknown design protocol: {self.protocol_name}")
     
@@ -120,20 +122,18 @@ class BinderDesigner:
         Returns:
             Tuple of (design_results, final_feature_dict).
         """
-        target_chains = self.design_params.get("target_chains")
-        binder_chains = self.design_params.get("binder_chains")
-
-        if not target_chains or not binder_chains:
-            raise ValueError("Target and binder chains must be specified in design_params.")
+        # Use chains from config
+        target_chains = self.config.target_chains
+        binder_chains = self.config.binder_chains
 
         # Modify feature_dict for binder design (common setup)
         feature_dict, target_indices, binder_indices = binder_utils.setup_binder_features(
             feature_dict, target_chains, binder_chains, fold_input=fold_input
         )
 
-        # Store indices in design_params for the protocol to access if needed
-        self.design_params['_target_indices'] = target_indices
-        self.design_params['_binder_indices'] = binder_indices
+        # Store indices for potential use
+        self._target_indices = target_indices
+        self._binder_indices = binder_indices
         
         # Convert necessary numpy arrays in feature_dict to JAX arrays for gradient updates
         # This might be better handled within the protocols if needed differently
@@ -147,7 +147,7 @@ class BinderDesigner:
 
         # Delegate to the selected protocol instance
         design_results, final_feature_dict = self.protocol_instance.design(
-                fold_input, feature_dict, target_indices, binder_indices, rng_key
+            fold_input, feature_dict, target_indices, binder_indices, rng_key
         )
         return design_results, final_feature_dict
 
@@ -162,7 +162,7 @@ def design_binder(
     feature_dict: features.BatchDict,
     model_runner: Any,
     ccd: chemical_components.Ccd,
-    design_params: Dict[str, Any],
+    design_config: DesignConfig,
     rng_seed: int = 0,
     buckets: Sequence[int] | None = None,
     ref_max_modified_date: datetime.date | None = None,
@@ -177,7 +177,7 @@ def design_binder(
         feature_dict: The feature dictionary for the model.
         model_runner: ModelRunner instance.
         ccd: Chemical component dictionary.
-        design_params: Dictionary of design parameters including 'protocol'.
+        design_config: Structured design configuration.
         rng_seed: Random seed for JAX.
         buckets: Optional bucket sizes for featurization of final prediction.
         ref_max_modified_date: Optional reference date for chemical components.
@@ -193,7 +193,7 @@ def design_binder(
     design_key, final_pred_key = jax.random.split(rng_key)
     
     # Initialize designer factory
-    designer = BinderDesigner(model_runner, ccd, design_params)
+    designer = BinderDesigner(model_runner, ccd, design_config)
     
     # Run design using the selected protocol
     design_results, best_feature_dict = designer.design_binder(
@@ -204,9 +204,9 @@ def design_binder(
     # The protocol itself should store these in the design_results dict
     design_results["best_feature_dict"] = best_feature_dict # Ensure this is passed back
     if "binder_indices" not in design_results:
-        design_results["binder_indices"] = designer.design_params.get('_binder_indices')
+        design_results["binder_indices"] = designer._binder_indices
     if "target_indices" not in design_results:
-        design_results["target_indices"] = designer.design_params.get('_target_indices')
+        design_results["target_indices"] = designer._target_indices
     # final_seq_logits should also be in design_results from the protocol
 
     # Run final prediction using the chosen method on the protocol instance

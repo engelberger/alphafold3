@@ -3,6 +3,7 @@
 import jax
 import jax.numpy as jnp
 import numpy as np
+from typing import Dict, List, Any, Optional
 
 def freeze_containers_for_jax(obj):
     """Makes a nested structure of dicts and lists JAX-compatible by making them immutable.
@@ -41,4 +42,19 @@ def safe_process_losses(losses):
         return {"loss": safe_jax_to_float(losses)}
 
     return {k: safe_jax_to_float(v) if hasattr(v, "item") or not isinstance(v, dict)
-            else safe_process_losses(v) for k, v in losses.items()} 
+            else safe_process_losses(v) for k, v in losses.items()}
+
+def print_log_line(prefix: str, log_data: Dict[str, Any], keys: Optional[List[str]] = None) -> None:
+    """Prints a formatted log line with selected keys from log_data."""
+    if keys is None:
+        keys = sorted(log_data.keys())
+    items: List[str] = []
+    for key in keys:
+        if key in log_data:
+            val = log_data[key]
+            if isinstance(val, float):
+                items.append(f"{key}={val:.3f}")
+            else:
+                items.append(f"{key}={val}")
+    line = prefix + " | " + ", ".join(items)
+    print(line) 

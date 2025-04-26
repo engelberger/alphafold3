@@ -6,7 +6,7 @@ from typing import Dict, Any, List, Optional, Tuple
 
 from alphafold3.design import metrics
 from alphafold3.design import logging as af_logging
-
+from alphafold3.design.config import DesignConfig
 # Get module logger
 logger = af_logging.get_logger(__name__)
 
@@ -14,7 +14,7 @@ logger = af_logging.get_logger(__name__)
 def create_metrics_collector_for_design(
     output_dir: str,
     run_name: str,
-    design_params: Dict[str, Any],
+    design_config: DesignConfig,
     format: str = "json",
     write_interval: int = 10,
 ) -> metrics.MetricsCollector:
@@ -23,7 +23,7 @@ def create_metrics_collector_for_design(
     Args:
         output_dir: Directory to write metrics files to
         run_name: Name of this run (used in filenames)
-        design_params: Design parameters from run_alphafold.py
+        design_config: Design parameters from run_alphafold.py
         format: Output format ('json' or 'csv')
         write_interval: How often to write metrics (every N steps)
         
@@ -31,7 +31,7 @@ def create_metrics_collector_for_design(
         Initialized MetricsCollector
     """
     # Use the protocol name in the metrics filename
-    protocol = design_params.get("protocol", "unknown")
+    protocol = design_config.protocol_name
     metrics_name = f"{run_name}_{protocol}"
     
     return metrics.create_metrics_collector(

@@ -9,6 +9,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
+import dataclasses
 
 from alphafold3.common import folding_input
 from alphafold3.common import memory_utils
@@ -114,8 +115,14 @@ class BoltzProtocol(BinderProtocol):
         Returns:
             Tuple of (design_results, updated_feature_dict).
         """
+        # Log initial config
         logging.info("=== Starting Boltz Design Trajectory ===")
+        logging.info(f"Config: lr={self.config.learning_rate}, stages={self.config.boltz_config.stages}, best_metric={self.config.best_metric}")
+        logging.info(f"Weights: {self.config.boltz_config.weights}")
         design_start_time = time.time()
+
+        # Access config values directly
+        helicity_bias = self.config.boltz_config.helicity_bias
 
         # Log design parameters
         binder_length = len(binder_indices)
@@ -123,7 +130,7 @@ class BoltzProtocol(BinderProtocol):
              seed = int(jax.random.randint(rng_key, (), 0, 100000))
         except Exception:
              seed = int(np.sum(np.frombuffer(rng_key.tobytes(), dtype=np.uint32))) % 100000
-        helicity_bias = self.design_params.get("helicity_bias", 0.0) # Note: helicity loss not yet implemented
+        random_init_scale = self.config.boltz_config.random_init_scale
 
         logging.info(f"Design parameters:")
         logging.info(f"- Protocol: Boltz")
@@ -135,7 +142,6 @@ class BoltzProtocol(BinderProtocol):
         rng_key, subkey = jax.random.split(rng_key)
 
         # Initialize logits
-        random_init_scale = self.design_params.get("random_init_scale", 0.01)
         num_residue_types = 20  # Standard amino acids
         binder_logits_shape = (len(binder_indices), num_residue_types)
         binder_logits = random_init_scale * jax.random.normal(
@@ -167,6 +173,9 @@ class BoltzProtocol(BinderProtocol):
             logging.debug("'is_ligand' key not found in features. No ligand detected.")
 
         apo_template_jax = None
+        # THIS IS ONLY USED NOW MOMENTARILY FOR DEBUGGING
+        has_ligand = False # THIS IS ONLY USED NOW MOMENTARILY FOR DEBUGGING
+        # THIS IS ONLY USED NOW MOMENTARILY FOR DEBUGGING
         if has_ligand:
             logging.info("Small-molecule target detected: preparing apo -> holo two-phase schedule")
             # Apo phase: strip out ligand–binder coordinates/features
@@ -198,36 +207,22 @@ class BoltzProtocol(BinderProtocol):
         holo_template_jax = freeze_containers_for_jax(feature_dict_template)
         # <--- End Apo/Holo Setup ---
 
-        # Extract weights for static compilation (ensure it's a standard dict)
-        design_weights_static = dict(self.design_params.get("weights", {}))
-        if not design_weights_static:
-            logging.warning("No weights found in design_params['weights']. Using defaults.")
-            # Provide default weights if missing
-            design_weights_static = {
-                'contact_intra': 1.0,
-                'contact_inter': 1.0,
-                'confidence': 0.5,
-                'seq_entropy': 0.01 # Default needed by loss function
-            }
-
-        # --- Define Stages --- (Simplified logic from original implementation)
-        # Defaulting to 4 core stages matching paper structure
-        original_stages_len = len(self.design_params.get("stages", []))
-        default_iters = [50, 50, 45, 5] # Default iters for 4 stages
+        # Define Stages based on config
+        boltz_stages = self.config.boltz_config.stages
         stages_config = [
-            {"name": "Warm-up", "iters": self.design_params.get("stages", default_iters)[0] if original_stages_len>0 else 50, "hard": False, "temp_range": (1.0, 1.0)},
-            {"name": "Mixed-logit", "iters": self.design_params.get("stages", default_iters)[1] if original_stages_len>1 else 50, "hard": False, "temp_range": (1.0, 1.0)},
-            {"name": "Anneal", "iters": self.design_params.get("stages", default_iters)[2] if original_stages_len>2 else 45, "hard": False, "temp_range": (1.0, 0.01)}, # Uses quadratic T schedule
-            {"name": "STE", "iters": self.design_params.get("stages", default_iters)[3] if original_stages_len>3 else 5, "hard": True, "temp_range": (0.01, 0.01)} # Uses STE
+            {"name": "Warm-up", "iters": boltz_stages[0], "hard": False, "temp_range": (1.0, 1.0)},
+            {"name": "Mixed-logit", "iters": boltz_stages[1], "hard": False, "temp_range": (1.0, 1.0)},
+            {"name": "Anneal", "iters": boltz_stages[2], "hard": False, "temp_range": (1.0, 0.01)}, # Uses quadratic T schedule
+            {"name": "STE", "iters": boltz_stages[3], "hard": True, "temp_range": (0.01, 0.01)} # Uses STE
             # PSSM stage removed
         ]
         # Only keep the number of stages defined by the length of the stages parameter
-        num_defined_stages = original_stages_len if original_stages_len > 0 else len(default_iters)
+        num_defined_stages = len(boltz_stages)
         stages = stages_config[:num_defined_stages]
 
-        logging.info(f"Using {len(stages)} stages for optimization:")
+        logging.info(f"Using {num_defined_stages} stages for optimization:")
         for i, stage in enumerate(stages):
-            logging.info(f"- Stage {i}: {stage.get('name', 'Unknown')} ({stage.get('iters', 0)} iters)")
+            logging.info(f"- Stage {i}: {stage['name']} ({stage['iters']} iters, Temp: {stage['temp_range'][0]:.2f}->{stage['temp_range'][1]:.2f}, Hard: {stage['hard']})" )
 
         # --- Prepare for optimization loop --- 
         # Convert indices for static compatibility if needed (JAX usually handles arrays fine)
@@ -245,15 +240,14 @@ class BoltzProtocol(BinderProtocol):
         # Define loss function for gradient calculation (inside design method)
         def loss_fn_for_grad_boltz(
             current_binder_logits,  # Differentiable
-            stage_idx_static,       # Static
-            temp_static,            # Static
-            progress_static,        # Static (for stage 2 schedule)
-            iter_key,               # Varies
-            # --- Potentially static arguments --- (Assumed static for now)
-            feature_dict_tmpl,      # Static
-            target_idxs,            # Static
-            binder_idxs,            # Static
-            design_weights,         # Static
+            stage_idx_static,         # Static
+            temp_static,              # Static
+            progress_static,          # Static (for stage 2 schedule)
+            iter_key,                 # Varies
+            feature_dict_tmpl,        # Static
+            target_idxs,              # Static
+            binder_idxs,              # Static
+            weights_dict_static,      # Static
             model_runner_ref,       # Static
             inter_k_arg: Optional[int] = None, # Holo specific k
             inter_l_arg: Optional[int] = None # Holo specific l
@@ -323,13 +317,13 @@ class BoltzProtocol(BinderProtocol):
                 target_idxs,
                 binder_idxs,
                 seq_representation, # Pass the representation used
-                design_params={'weights': design_weights},
+                weights_config=weights_dict_static,
                 compute_confidence_loss=True, # Default unless overridden by mode
                 inter_k=inter_k_arg,
                 inter_l=inter_l_arg
             )
 
-            # Add sequence entropy loss based on soft probabilities in hard stage (STE stage)
+            # Add sequence entropy loss (always calculated based on weights_dict)
             if stage_idx_static == 3:
                  # Use softmax of logits/temp for entropy calculation stability
                  probs_for_entropy = jax.nn.softmax(logits_over_temp, axis=-1)
@@ -337,7 +331,8 @@ class BoltzProtocol(BinderProtocol):
                  # One-hot target derived from argmax of the same soft probabilities
                  one_hot_target = jax.nn.one_hot(jnp.argmax(probs_clamped, axis=-1), num_classes=probs_clamped.shape[-1])
                  one_hot_loss = -jnp.sum(one_hot_target * jnp.log(probs_clamped)) / len(binder_idxs)
-                 seq_entropy_weight = design_weights.get("seq_entropy", 0.01)
+                 # Pull sequence entropy weight from the LossWeightsConfig
+                 seq_entropy_weight = weights_dict_static.seq_entropy
                  total_loss += seq_entropy_weight * one_hot_loss
                  loss_breakdown["seq_one_hot_entropy"] = one_hot_loss * seq_entropy_weight
 
@@ -347,16 +342,19 @@ class BoltzProtocol(BinderProtocol):
         grad_fn = jax.value_and_grad(loss_fn_for_grad_boltz, has_aux=True)
 
         # --- Optimization Loop --- 
-        optimizer = optax.adam(learning_rate=self.design_params.get("learning_rate", 0.01)) # Use base LR for now
+        # Use global learning rate from config
+        optimizer = optax.adam(learning_rate=self.config.learning_rate)
         opt_state = optimizer.init(binder_logits)
 
         # --- Apo Warmup Phase (if ligand detected) ---
         logging.debug(f"DEBUG: Checking conditions for apo loop: has_ligand={has_ligand}, apo_template_jax is None: {apo_template_jax is None}") # <<< Explicit check before IF
+        # For debugging purposes, set has_ligand to False even if ligand is detected! 
+        has_ligand = False
         if has_ligand and apo_template_jax is not None:
-            num_apo_steps = 50 # Reduced for debugging
+            num_apo_steps = 1 # Reduced for debugging
             logging.info(f"---> Starting {num_apo_steps} apo-phase warmup iterations (no ligand) <---") # <<< Start of loop block
             # Temporarily override inter-contact weight to zero
-            apo_weights = design_weights_static.copy()
+            apo_weights = self.config.boltz_config.weights.copy()
             apo_weights['contact_inter'] = 0.0
 
             # Use grad_fn with apo template
@@ -375,7 +373,7 @@ class BoltzProtocol(BinderProtocol):
                         feature_dict_tmpl=apo_template_jax, # <-- Use APO template
                         target_idxs=target_indices_jnp,
                         binder_idxs=binder_indices_jnp,
-                        design_weights=apo_weights, # <-- Use APO weights
+                        weights_dict_static=apo_weights, # <-- Use APO weights
                         model_runner_ref=model_runner_obj
                         # No inter_k/l needed for apo
                     )
@@ -402,28 +400,32 @@ class BoltzProtocol(BinderProtocol):
             loss_fn_custom_args = {}
         # <--- End Apo/Holo Setup ---
 
-        best_loss = float('inf')
+        # Use the configured metric for tracking best
+        best_metric_value = float('inf')
+        metric_higher_is_better = self.config.best_metric in ["plddt_score"] # Add other metrics if needed
         best_logits = None
         best_metrics = None
         best_feature_dict = None # Store the feature dict corresponding to best_logits
-        trajectory = {
-            "step": [], "loss": [], "plddt": [], "pae_loss": [], "contact_inter": [],
-             "contact_intra": [], "time": []
+        trajectory = {  # Initialize trajectory
+            "step": [],
+            "loss": [],
+            "plddt": [],
+            "pae_loss": [],
+            "contact_inter": [],
+            "contact_intra": [],
+            "time": [],
+            "log_history": [],
         }
 
         current_iter = 0
         for stage_idx, stage in enumerate(stages):
-            stage_name = stage.get("name", f"Stage {stage_idx}")
-            stage_iters = stage.get("iters", 0)
-            start_temp, end_temp = stage.get("temp_range", (1.0, 1.0))
-            hardness = stage.get("hard", False)
+            stage_name = f"Stage {stage_idx}"
+            stage_iters = stage['iters']
+            start_temp, end_temp = stage['temp_range']
+            hardness = stage['hard']
             # plddt_threshold = stage.get("plddt_threshold", 0.0)
 
-            # --- PSSM Stage Removed --- 
-            # if stage_name == "PSSM-Greedy": # Handle PSSM stage separately
-            #      logging.info(f"Stage {stage_idx}: Running PSSM Semigreedy Optimization ({stage_iters} iters)...")
-            #      # ... (rest of PSSM logic removed) ...
-            #      continue # Move to next stage after PSSM
+
 
             logging.info(f"Stage {stage_idx}: {stage_name} ({stage_iters} iters, Temp: {start_temp:.2f}->{end_temp:.2f}, Hard: {hardness})")
 
@@ -447,7 +449,7 @@ class BoltzProtocol(BinderProtocol):
                         current_template_jax,
                         target_indices_jnp,
                         binder_indices_jnp,
-                        design_weights_static,
+                        self.config.boltz_config.weights,
                         model_runner_obj,
                         # Pass k/l explicitly
                         inter_k_arg=loss_fn_custom_args.get('inter_k'),
@@ -459,8 +461,12 @@ class BoltzProtocol(BinderProtocol):
                         continue
 
                     # Update logits
+                    # Let debug log a summary of the update
+                    logging.debug(f"Iter {current_iter}: Updating logits with grads shape={grads.shape}")
                     updates, opt_state = optimizer.update(grads, opt_state)
+                    logging.debug(f"Iter {current_iter}: Applying updates to logits")
                     binder_logits = optax.apply_updates(binder_logits, updates)
+                    logging.debug(f"Iter {current_iter}: Logits updated, new shape={binder_logits.shape}")
 
                     # Log metrics (extract from loss_breakdown)
                     plddt_loss_neg_mean = loss_breakdown.get("plddt_neg_mean", 0.0)
@@ -488,25 +494,35 @@ class BoltzProtocol(BinderProtocol):
                     trajectory["contact_inter"].append(safe_jax_to_float(contact_inter))
                     trajectory["contact_intra"].append(safe_jax_to_float(contact_intra))
                     trajectory["time"].append(iter_time)
+                    trajectory["log_history"].append({
+                        "loss": safe_jax_to_float(loss_val),
+                        "plddt_score": plddt_score,
+                        "pae_loss": safe_jax_to_float(pae_loss),
+                        "contact_inter": safe_jax_to_float(contact_inter),
+                        "contact_intra": safe_jax_to_float(contact_intra)
+                    })
 
-                    # Check if this is the best loss so far
-                    if loss_val < best_loss:
-                        best_loss = loss_val
+                    # Extract the latest log entry for metric comparison
+                    log_data = trajectory["log_history"][-1]
+                    logging.debug(f"Iter {current_iter}: log_data={log_data}")
+                    
+                    # Check if this is the new best
+                    current_metric_value = log_data.get(self.config.best_metric, float('inf'))
+
+                    # Convert to minimization problem
+                    comparison_value = -current_metric_value if metric_higher_is_better else current_metric_value
+
+                    # Check if this is the new best
+                    if comparison_value < best_metric_value:
+                        best_metric_value = comparison_value
                         best_logits = binder_logits.copy()
-                        best_metrics = {
-                            "loss": safe_jax_to_float(loss_val),
-                            # Store the actual pLDDT score (0-100)
-                            "plddt_score": plddt_score,
-                            "pae_loss": safe_jax_to_float(pae_loss),
-                            "contact_inter": safe_jax_to_float(contact_inter),
-                            "contact_intra": safe_jax_to_float(contact_intra)
-                        }
+                        best_metrics = log_data # Store the entire log dict as best metrics
                         # Regenerate feature dict for the best logits
                         logging.debug(f"Iter {current_iter}: New best found. Regenerating feature dict.")
                         best_feature_dict = binder_utils.update_features_from_logits(
                              current_template_jax, binder_indices_jnp, best_logits
                         )
-                        logging.info(f"Iter {current_iter}: New best loss={best_metrics['loss']:.4f} pLDDT={best_metrics['plddt_score']:.1f}")
+                        logging.info(f"Iter {current_iter}: New best {self.config.best_metric}={current_metric_value:.4f}")
 
                     current_iter += 1
 
@@ -526,11 +542,13 @@ class BoltzProtocol(BinderProtocol):
         # --- End of all stages --- 
 
         # Ensure best logits and feature dict are available
-        if best_logits is None:
-             logging.warning("Design finished without ever improving initial loss. Using final logits.")
+        if best_logits is None or best_metrics is None:
+             logging.warning(f"Design finished without improving {self.config.best_metric}. Using final state.")
              best_logits = binder_logits
-             best_loss = trajectory["loss"][-1] if trajectory["loss"] else float('inf')
-             best_metrics = {k: v[-1] for k, v in trajectory.items() if k != 'step' and v} if trajectory["loss"] else {}
+             # Try to get metrics from the last trajectory point
+             best_metrics = trajectory["log_history"][-1] if trajectory["log_history"] else {"loss": float('nan')}
+             best_metric_value = best_metrics.get(self.config.best_metric, float('nan'))
+             if metric_higher_is_better: best_metric_value *= -1
 
         if best_feature_dict is None:
              logging.warning("Regenerating best_feature_dict from best_logits at the end.")
@@ -548,7 +566,8 @@ class BoltzProtocol(BinderProtocol):
             "protocol": "binder_boltz",
             "target_indices": target_indices,
             "binder_indices": binder_indices,
-            "best_loss": safe_jax_to_float(best_loss),
+            "best_metric": self.config.best_metric,
+            "best_metric_value": best_metric_value if not metric_higher_is_better else -best_metric_value,
             "best_metrics": best_metrics,
             "trajectory": trajectory,
             "design_time": time.time() - design_start_time,
@@ -557,12 +576,12 @@ class BoltzProtocol(BinderProtocol):
             "final_sequence": final_sequence,
             "best_feature_dict": best_feature_dict,
             # Use the calculated positive plddt_score for success check
-            "success": best_metrics.get("plddt_score", 0.0) > 70.0 # Example threshold 70
+            "success": best_metrics.get("plddt_score", 0.0) > 70.0 # Example threshold 70, could be configurable
         }
 
         logging.info(f"Boltz design completed in {design_results['design_time']:.2f}s")
         # Use the correct key for logging the final score
-        logging.info(f"Best loss: {design_results['best_loss']:.4f}, Best pLDDT score: {best_metrics.get('plddt_score', 0.0):.1f}")
+        logging.info(f"Best {self.config.best_metric}: {design_results['best_metric_value']:.4f}")
         logging.info(f"Final sequence: {final_sequence}")
 
         return design_results, best_feature_dict
@@ -575,6 +594,7 @@ class BoltzProtocol(BinderProtocol):
     ) -> Tuple[model.ModelResult, features.BatchDict, folding_input.Input]:
         """Run a final prediction with the designed sequence (Simplified)."""
         # This implementation can be identical to the one in GradientProtocol
+        # TODO(feliper): Consolidate this method into the base class?
         # Copying the implementation here for completeness
         logging.info("Running final prediction with designed sequence (Simplified Method)...")
 
@@ -590,9 +610,10 @@ class BoltzProtocol(BinderProtocol):
             logging.info(f"Designed sequence ({len(designed_sequence)} aa): {designed_sequence[:50]}...")
 
             new_chains = []
-            binder_chains = self.design_params.get("binder_chains", [])
+            # Access binder chains from config
+            binder_chains = self.config.binder_chains
             if not binder_chains:
-                logging.error("Binder chains not specified.")
+                logging.error("Binder chains not specified in config.")
                 return {"error": "Missing binder chains"}, {}, fold_input
 
             binder_seq_by_chain = {}

@@ -41,6 +41,11 @@ def entropy_low_bins(distogram_logits, bin_edges, cutoff_angstrom):
     Returns:
         Entropy calculated over bins below the cutoff (per pair) (*, N, N).
     """
+    logger.debug(
+        f"entropy_low_bins called with cutoff={cutoff_angstrom}, "
+        f"distogram_logits.shape={getattr(distogram_logits, 'shape', None)}, "
+        f"bin_edges.shape={getattr(bin_edges, 'shape', None)}"
+    )
     if distogram_logits is None or bin_edges is None:
         # Return a placeholder or raise an error if inputs are missing
         # Returning zeros might silently hide issues
@@ -51,24 +56,28 @@ def entropy_low_bins(distogram_logits, bin_edges, cutoff_angstrom):
     # Using upper bounds matches the paper's intent (bins_high <= cutoff)
     bin_width = bin_edges[1] - bin_edges[0] # Assume uniform bins
     bins_high = jnp.append(bin_edges, bin_edges[-1] + bin_width)
+    logger.debug(f"bins_high: {bins_high}")
 
     # Create mask for bins below the cutoff
     low_bin_mask = (bins_high <= cutoff_angstrom).astype(jnp.float32)
+    logger.debug(f"low_bin_mask sum: {jnp.sum(low_bin_mask)}, mask shape: {low_bin_mask.shape}")
 
     # Ensure mask has correct dimensions for broadcasting: (1, 1, B)
     low_bin_mask = low_bin_mask.reshape((1,) * (distogram_logits.ndim - 1) + (-1,))
 
     # Calculate softmax over all bins (q)
     q = jax.nn.softmax(distogram_logits, axis=-1) # Shape (*, N, N, B)
+    logger.debug(f"q first 5 entries: {q.flatten()[:5]}")
 
     # Calculate masked softmax (q_star) using logit trick for numerical stability
-    # Subtract a large number from logits of high-distance bins
     q_star_logits = distogram_logits - 1e7 * (1.0 - low_bin_mask)
     q_star = jax.nn.softmax(q_star_logits, axis=-1) # Eq 5: Softmax over masked logits
+    logger.debug(f"q_star first 5 entries: {q_star.flatten()[:5]}")
 
     # Calculate entropy using q_star to weight the log probabilities of q (Eq 2)
     # Add epsilon for log stability
     entropy = -jnp.sum(q_star * jnp.log(q + 1e-9), axis=-1) # Shape (*, N, N)
+    logger.debug(f"entropy shape: {entropy.shape}, first 5 entries: {entropy.flatten()[:5]}")
 
     return entropy
 
