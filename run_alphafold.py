@@ -46,7 +46,7 @@ from alphafold3.common import resources
 from alphafold3.constants import chemical_components
 import alphafold3.cpp
 from alphafold3.data import featurisation
-from alphafold3.data import pipeline
+from alphafold3.data import pipeline as data_pipeline
 from alphafold3.jax.attention import attention
 from alphafold3.model import features
 from alphafold3.model import model
@@ -61,6 +61,9 @@ from alphafold3.data.custom_utils import parse_mutation_string, apply_mutations_
 from alphafold3.model import data_constants
 from alphafold3.design import binder_design
 from alphafold3.design.config import DesignConfig, BoltzDesignConfig, GradientDesignConfig, LossWeightsConfig
+from alphafold3.model import model_config
+from alphafold3.model import pipeline as model_pipeline
+import design_flags # Import the renamed flags file
 
 _HOME_DIR = pathlib.Path(os.environ.get('HOME'))
 _DEFAULT_MODEL_DIR = _HOME_DIR / 'models'
@@ -336,7 +339,7 @@ _BOLTZ_STAGE3_STEPS = flags.DEFINE_integer(
     'boltz_stage3_steps', 50, 'Steps for BoltzDesign1 Stage 3 (convergence).'
 )
 _BOLTZ_STAGE4_STEPS = flags.DEFINE_integer(
-    'boltz_stage4_steps', 50, 'Steps for BoltzDesign1 Stage 4 (one-hot).'
+    'boltz_stage4_steps', 50, 'Steps for BoltzDesign1 Stage 4 (final STE).'
 )
 _BOLTZ_CONTACT_INTRA_WEIGHT = flags.DEFINE_float(
     'boltz_contact_intra_weight', 0.5, 'Weight for intra-binder distogram entropy loss (Boltz protocol).'
@@ -443,6 +446,12 @@ flags.DEFINE_integer(
     'If set, overrides the random seeds specified in the input JSON with this '
     'single seed.',
 )
+flags.DEFINE_string(
+    'design_best_metric',
+    None,
+    'Best metric to use for design protocol.',
+)
+
 # --------------------
 
 def _get_version_or_git_sha() -> str:
@@ -803,7 +812,7 @@ def replace_db_dir(path_with_db_dir: str, db_dirs: Sequence[str]) -> str:
 @overload
 def process_fold_input(
     fold_input: folding_input.Input,
-    data_pipeline_config: pipeline.DataPipelineConfig | None,
+    data_pipeline_config: data_pipeline.DataPipelineConfig | None,
     model_runner: None,
     output_dir: os.PathLike[str] | str,
     mutations_str: Optional[str],
@@ -820,7 +829,7 @@ def process_fold_input(
 @overload
 def process_fold_input(
     fold_input: folding_input.Input,
-    data_pipeline_config: pipeline.DataPipelineConfig | None,
+    data_pipeline_config: data_pipeline.DataPipelineConfig | None,
     model_runner: ModelRunner,
     output_dir: os.PathLike[str] | str,
     mutations_str: Optional[str],
@@ -836,7 +845,7 @@ def process_fold_input(
 
 def process_fold_input(
     fold_input: folding_input.Input,
-    data_pipeline_config: pipeline.DataPipelineConfig | None,
+    data_pipeline_config: data_pipeline.DataPipelineConfig | None,
     model_runner: ModelRunner | None,
     output_dir: os.PathLike[str] | str,
     mutations_str: Optional[str],
@@ -911,7 +920,7 @@ def process_fold_input(
     print('Running data pipeline...')
     logging.info("Running data pipeline...")
     try:
-        data_pipeline_runner = pipeline.DataPipeline(
+        data_pipeline_runner = data_pipeline.DataPipeline(
             data_pipeline_config=data_pipeline_config,
             mutations_str=mutations_str,
             masking_config=masking_config
@@ -1261,7 +1270,7 @@ def main(_):
     logging.info("Preparing data pipeline configuration...")
     expand_path = lambda x: replace_db_dir(x, DB_DIR.value)
     try:
-        data_pipeline_config = pipeline.DataPipelineConfig(
+        data_pipeline_config = data_pipeline.DataPipelineConfig(
             jackhmmer_binary_path=_JACKHMMER_BINARY_PATH.value,
             nhmmer_binary_path=_NHMMER_BINARY_PATH.value,
             hmmalign_binary_path=_HMMALIGN_BINARY_PATH.value,
@@ -1372,7 +1381,15 @@ def main(_):
       logging.info(f"Running Gradient Binder Design: Target={FLAGS.target_chains}, Binder={FLAGS.binder_chains}")
       gradient_cfg = GradientDesignConfig(
           steps=FLAGS.design_steps,
-          weights=weights_cfg
+          weights=weights_cfg,
+          # Read STE params from design_flags
+          ste_alpha=flags.FLAGS.gradient_ste_alpha,
+          ste_temp_start=flags.FLAGS.gradient_ste_temp_start,
+          ste_temp_end=flags.FLAGS.gradient_ste_temp_end,
+          ste_soft_start=flags.FLAGS.gradient_ste_soft_start,
+          ste_soft_end=flags.FLAGS.gradient_ste_soft_end,
+          ste_hard_start=flags.FLAGS.gradient_ste_hard_start,
+          ste_hard_end=flags.FLAGS.gradient_ste_hard_end,
       )
     elif FLAGS.protocol == DesignProtocol.BINDER_BOLTZ:
       logging.info(f"Running BoltzDesign1 Binder Protocol: Target={FLAGS.target_chains}, Binder={FLAGS.binder_chains}")
@@ -1384,20 +1401,26 @@ def main(_):
             FLAGS.boltz_stage4_steps
           ],
           # Note: random_init_scale uses default (0.01) from config
-          weights=weights_cfg
+          weights=weights_cfg,
+          # Read STE params from design_flags
+          ste_alpha=flags.FLAGS.boltz_ste_alpha,
+          ste_temp_start=flags.FLAGS.boltz_ste_temp_start,
+          ste_temp_end=flags.FLAGS.boltz_ste_temp_end,
+          ste_soft_start=flags.FLAGS.boltz_ste_soft_start,
+          ste_soft_end=flags.FLAGS.boltz_ste_soft_end,
+          ste_hard_start=flags.FLAGS.boltz_ste_hard_start,
+          ste_hard_end=flags.FLAGS.boltz_ste_hard_end,
       )
 
     # 3. Instantiate top-level config
-    # Use defaults from DesignConfig for verbosity, best_metric, traj_max
     design_config = DesignConfig(
         protocol_name=FLAGS.protocol.value,
         learning_rate=FLAGS.design_learning_rate,
         clear_memory_interval=FLAGS.clear_memory_interval,
-        # verbosity=1, # Uses default from dataclass
-        # best_metric="loss", # Uses default from dataclass
-        # traj_max=10, # Uses default from dataclass
+        best_metric=FLAGS.design_best_metric,
         target_chains=FLAGS.target_chains,
         binder_chains=FLAGS.binder_chains,
+        optimizer_name=flags.FLAGS.design_optimizer,
         boltz_config=boltz_cfg,
         gradient_config=gradient_cfg,
     )

@@ -3,6 +3,8 @@ import jax
 import jax.numpy as jnp
 from absl import logging
 from alphafold3.common import folding_input
+from alphafold3.design.config import ALPHABET_SIZE # Import alphabet size
+from typing import Dict, Any
 
 def get_residue_indices(int_asym_ids, target_chains, binder_chains, int_to_str_chain_map):
     """Maps integer asym_ids to residue indices for target and binder.
@@ -263,69 +265,178 @@ def setup_binder_features(feature_dict, target_chains, binder_chains, fold_input
     logging.info("Binder feature setup complete")
     return feature_dict, target_indices, binder_indices
 
-def update_features_from_logits(feature_dict, binder_indices, binder_seq_logits):
-    """Updates feature_dict in place based on current binder sequence logits.
-    
+def update_features_from_logits(
+    feature_dict: Dict[str, Any],
+    binder_indices: jnp.ndarray,
+    seq_repr_dict: Dict[str, jnp.ndarray] # New input from soft_seq_af3
+) -> Dict[str, Any]:
+    """Updates feature_dict based on sequence representations (including STE).
+
     Args:
         feature_dict: Dictionary of model features.
         binder_indices: Indices of the binder residues.
-        binder_seq_logits: Sequence logits for the binder regions.
-        
+        seq_repr_dict: Dictionary containing sequence representations
+                       (output of sequence_utils.soft_seq_af3), expected keys:
+                       'hard' (STE one-hot), 'pseudo' (differentiable mixture).
+
     Returns:
         Updated feature dictionary.
     """
     from absl import logging
-    # Ensure everything is JAX arrays
+
+    # Ensure binder_indices is JAX array
     binder_indices = jnp.asarray(binder_indices)
-    binder_seq_logits = jnp.asarray(binder_seq_logits)
-    
+
+    # Extract needed representations
+    if 'hard' not in seq_repr_dict or 'pseudo' not in seq_repr_dict:
+        raise ValueError("seq_repr_dict must contain 'hard' and 'pseudo' keys.")
+    ste_hard = seq_repr_dict['hard'] # Shape (L_binder, ALPHABET_SIZE)
+    pseudo_probs = seq_repr_dict['pseudo'] # Shape (L_binder, ALPHABET_SIZE)
+
+    # --- Determine discrete aatype from STE hard representation --- #
+    # This provides the discrete sequence info needed by parts of the model
+    binder_aatype_ste = jnp.argmax(ste_hard, axis=-1) # Shape (L_binder,)
+    logging.debug(f"binder_aatype_ste shape: {binder_aatype_ste.shape}")
+
+    # --- Create differentiable MSA profile/first row from pseudo probs --- #
+    # This is used for features requiring differentiable sequence input
+    # For MSA profile, it's directly the probabilities
+    binder_profile = pseudo_probs # Shape (L_binder, ALPHABET_SIZE)
+    # For the first row of MSA (often used as target sequence representation),
+    # we might need the one-hot encoding *of the pseudo probabilities*
+    # Let's use the one-hot derived from the STE for consistency in discrete parts
+    # and use the pseudo_probs for continuous parts like profile.
+    binder_msa_first_row_ste = ste_hard # Shape (L_binder, ALPHABET_SIZE)
+
+    logging.debug(f"binder_profile (from pseudo) shape: {binder_profile.shape}")
+    logging.debug(f"binder_msa_first_row_ste (from hard) shape: {binder_msa_first_row_ste.shape}")
+
     if 'design_mask' not in feature_dict:
         logging.warning("'design_mask' not found in feature_dict. Adding default mask based on binder_indices.")
-        design_mask = jnp.zeros((feature_dict.get('aatype', jnp.zeros((100,))).shape[0],), dtype=jnp.int32)
-        # Use dynamic_update_slice or functional scatter update instead of at[] for better JAX compatibility
+        # Determine sequence length from a reliable feature like seq_mask or token_features.mask
+        seq_len_key = next((k for k in ['seq_mask', 'token_features.mask'] if k in feature_dict), None)
+        if seq_len_key:
+             seq_len = feature_dict[seq_len_key].shape[0]
+        else:
+             # Fallback: try inferring from aatype if present
+             seq_len = feature_dict.get('aatype', jnp.zeros((100,))).shape[0]
+             logging.warning(f"Could not find seq_mask, inferring seq_len={seq_len} from aatype.")
+
+        design_mask = jnp.zeros((seq_len,), dtype=jnp.int32)
+        design_mask = design_mask.at[binder_indices].set(1)
         feature_dict['design_mask'] = design_mask
-    
-    # Calculate probabilities and aatype
-    binder_probs = jax.nn.softmax(binder_seq_logits, axis=-1)
-    binder_aatype = jnp.argmax(binder_probs, axis=-1)
-    
-    # Make a copy of the feature dict to avoid in-place mutation issues with JAX
-    updated_feature_dict = {}
-    
+
+    # --- Update Feature Dictionary --- #
+    # Make a copy to avoid in-place mutation issues with JAX
+    updated_feature_dict = {**feature_dict} # Shallow copy is usually sufficient for JAX
+
     # Process each key in the feature dict
     for k, v in feature_dict.items():
         if k == 'aatype':
-            # Update 'aatype' feature using scatter
+            # Update 'aatype' using the discrete STE-derived type
             target_dtype = v.dtype
-            updated_v = v.copy()  # Make a copy to avoid in-place operations
+            # Use functional scatter update for JAX compatibility
+            updated_feature_dict[k] = v.at[binder_indices].set(binder_aatype_ste.astype(target_dtype))
+            logging.debug(f"Updated {k} using STE argmax with shape {updated_feature_dict[k].shape}")
+
+        elif k == 'msa' and isinstance(v, (np.ndarray, jnp.ndarray)) and v.ndim >= 2 and v.shape[0] > 0:
+            # Update the first row of MSA (often target sequence) using STE one-hot
+            # Check if v is a dict (as seen in logs) or array
+            # Based on logs, feature_dict['msa'] can be a dict {'rows': ..., 'profile': ...}
+            # We need to handle this structure.
+            if isinstance(v, dict):
+                current_msa_rows = v.get('rows')
+                current_msa_profile = v.get('profile')
+                updated_msa_dict = {**v} # Copy the dict
+
+                if current_msa_rows is not None and current_msa_rows.ndim >= 2 and current_msa_rows.shape[0] > 0:
+                    target_dtype_rows = current_msa_rows.dtype
+                    # Update first row with STE hard representation (one-hot)
+                    # Need to ensure binder_msa_first_row_ste has correct shape (L_binder, num_residue_types+1?)
+                    # If MSA rows are integer indices, convert STE one-hot back to indices
+                    if jnp.issubdtype(target_dtype_rows, jnp.integer):
+                        msa_row_indices = jnp.argmax(binder_msa_first_row_ste, axis=-1)
+                        logging.debug(f"Updating MSA rows[0] (int) at binder indices.")
+                        updated_msa_dict['rows'] = current_msa_rows.at[0, binder_indices].set(msa_row_indices.astype(target_dtype_rows))
+                    # If MSA rows are one-hot floats, use STE one-hot directly
+                    elif jnp.issubdtype(target_dtype_rows, jnp.floating):
+                         # Check if ALPHABET_SIZE matches the feature dimension
+                         if binder_msa_first_row_ste.shape[-1] != current_msa_rows.shape[-1]:
+                              logging.warning(f"MSA row feature dimension mismatch: STE ({binder_msa_first_row_ste.shape[-1]}) vs MSA ({current_msa_rows.shape[-1]}). Attempting zero-padding.")
+                              # Pad STE representation if needed (e.g., for GAP/UNK)
+                              padding = [(0,0)] * (binder_msa_first_row_ste.ndim - 1) + [(0, current_msa_rows.shape[-1] - binder_msa_first_row_ste.shape[-1])]
+                              padded_ste = jnp.pad(binder_msa_first_row_ste, padding)
+                         else:
+                              padded_ste = binder_msa_first_row_ste
+                         logging.debug(f"Updating MSA rows[0] (float) at binder indices.")
+                         updated_msa_dict['rows'] = current_msa_rows.at[0, binder_indices].set(padded_ste.astype(target_dtype_rows))
+                    else:
+                         logging.warning(f"MSA rows have unexpected dtype {target_dtype_rows}. Skipping update.")
+
+                # Update profile using the differentiable pseudo probabilities
+                if current_msa_profile is not None:
+                    target_dtype_profile = current_msa_profile.dtype
+                     # Check if ALPHABET_SIZE matches the feature dimension
+                    if binder_profile.shape[-1] != current_msa_profile.shape[-1]:
+                        logging.warning(f"MSA profile feature dimension mismatch: Pseudo ({binder_profile.shape[-1]}) vs Profile ({current_msa_profile.shape[-1]}). Attempting zero-padding.")
+                        # Pad pseudo probabilities if needed
+                        padding = [(0,0)] * (binder_profile.ndim - 1) + [(0, current_msa_profile.shape[-1] - binder_profile.shape[-1])]
+                        padded_profile = jnp.pad(binder_profile, padding)
+                    else:
+                        padded_profile = binder_profile
+                    logging.debug(f"Updating MSA profile at binder indices.")
+                    updated_msa_dict['profile'] = current_msa_profile.at[binder_indices].set(padded_profile.astype(target_dtype_profile))
+
+                updated_feature_dict[k] = updated_msa_dict
+                logging.debug(f"Updated MSA dict components.")
+            else:
+                 # Handle case where feature_dict['msa'] is an array (MSA rows or one-hot floats)
+                 target_dtype = v.dtype
+                 # Case 1: 2D array (MSA rows, possibly converted to float)
+                 if v.ndim == 2:
+                     # Update MSA rows: assign discrete aatype values to first row
+                     msa_row_indices = jnp.argmax(binder_msa_first_row_ste, axis=-1)
+                     updated_feature_dict[k] = v.at[0, binder_indices].set(msa_row_indices.astype(target_dtype))
+                     logging.debug(f"Updated {k}[0] using STE argmax for 2D MSA rows with shape {updated_feature_dict[k].shape}")
+                 # Case 2: integer dtype and >=2D (redundant but kept for clarity)
+                 elif jnp.issubdtype(target_dtype, jnp.integer):
+                     msa_row_indices = jnp.argmax(binder_msa_first_row_ste, axis=-1)
+                     updated_feature_dict[k] = v.at[0, binder_indices].set(msa_row_indices.astype(target_dtype))
+                     logging.debug(f"Updated {k}[0] (int) using STE argmax with shape {updated_feature_dict[k].shape}")
+                 # Case 3: float dtype and 3D array (one-hot features)
+                 elif jnp.issubdtype(target_dtype, jnp.floating) and v.ndim >= 3:
+                     # One-hot float array: update using STE one-hot vectors
+                     if binder_msa_first_row_ste.shape[-1] != v.shape[-1]:
+                         logging.warning(f"MSA row feature dimension mismatch: STE ({binder_msa_first_row_ste.shape[-1]}) vs MSA ({v.shape[-1]}). Attempting zero-padding.")
+                         padding = [(0,0)] * (binder_msa_first_row_ste.ndim - 1) + [(0, v.shape[-1] - binder_msa_first_row_ste.shape[-1])]
+                         padded_ste = jnp.pad(binder_msa_first_row_ste, padding)
+                     else:
+                         padded_ste = binder_msa_first_row_ste
+                     updated_feature_dict[k] = v.at[0, binder_indices].set(padded_ste.astype(target_dtype))
+                     logging.debug(f"Updated {k}[0] (float) using STE one-hot with shape {updated_feature_dict[k].shape}")
+                 else:
+                     logging.warning(f"MSA array has unexpected shape/dtype (ndim={v.ndim}, dtype={target_dtype}). Skipping update.")
             
-            def update_indices(val, idx):
-                # Use functional scatter
-                updated_val = val.at[idx].set(binder_aatype.astype(target_dtype))
-                return updated_val
-            
-            # Update the aatype features at binder indices
-            updated_feature_dict[k] = update_indices(v, binder_indices)
-            
-            logging.debug(f"Updated {k} with shape {updated_feature_dict[k].shape}")
-        
-        elif k == 'msa' and v.shape[0] > 0:
-            # Update msa for the first row (target sequence) using scatter
-            target_dtype = v.dtype
-            updated_v = v.copy()  # Make a copy to avoid in-place operations
-            
-            # Define update function for MSA - uses functional scatter approach
-            def update_msa_indices(val, row_idx, col_indices):
-                # Update first row of MSA at binder positions
-                updated_val = val.at[row_idx, col_indices].set(binder_aatype.astype(target_dtype))
-                return updated_val
-            
-            # Update the first row of MSA at binder positions
-            updated_feature_dict[k] = update_msa_indices(v, 0, binder_indices)
-            
-            logging.debug(f"Updated {k} with shape {updated_feature_dict[k].shape}")
-        else:
-            # Copy other features as-is
-            updated_feature_dict[k] = v
-    
+        elif k == 'msa_profile': # Explicitly handle msa_profile if it's separate
+             target_dtype_profile = v.dtype
+             if binder_profile.shape[-1] != v.shape[-1]:
+                 logging.warning(f"MSA profile feature dimension mismatch: Pseudo ({binder_profile.shape[-1]}) vs Profile ({v.shape[-1]}). Attempting zero-padding.")
+                 padding = [(0,0)] * (binder_profile.ndim - 1) + [(0, v.shape[-1] - binder_profile.shape[-1])]
+                 padded_profile = jnp.pad(binder_profile, padding)
+             else:
+                 padded_profile = binder_profile
+             updated_feature_dict[k] = v.at[binder_indices].set(padded_profile.astype(target_dtype_profile))
+             logging.debug(f"Updated {k} using pseudo probs with shape {updated_feature_dict[k].shape}")
+
+        # Note: Other features are implicitly copied by updated_feature_dict = {**feature_dict}
+
+    # Check if essential features were updated
+    if 'aatype' not in updated_feature_dict or not jnp.any(updated_feature_dict['aatype'] != feature_dict['aatype']):
+        logging.warning("'aatype' feature might not have been updated correctly.")
+    if 'msa' not in updated_feature_dict:
+         # Check if msa_profile was updated instead
+         if 'msa_profile' not in updated_feature_dict or ('msa_profile' in feature_dict and not jnp.any(updated_feature_dict['msa_profile'] != feature_dict['msa_profile'])):
+              logging.warning("Neither 'msa' dict nor 'msa_profile' seemed to be updated correctly.")
+
+    logging.debug(f"Finished updating features from logits.")
     return updated_feature_dict 

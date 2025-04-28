@@ -169,10 +169,9 @@ def calculate_boltzdesign_distogram_loss(
 
 def calculate_boltzdesign_binder_loss(
     partial_result: Dict[str, Any], # Model output (potentially partial)
-    feature_dict: Dict[str, Any],
+    feature_dict: Dict[str, Any], # Must contain updated features based on STE
     target_indices: jnp.ndarray,
     binder_indices: jnp.ndarray,
-    seq_representation: jnp.ndarray, # Softmax probs or STE
     weights_config: LossWeightsConfig, # Use typed config
     compute_confidence_loss: bool = True, # Flag to control confidence loss computation
     inter_k: Optional[int] = None, # Holo phase k override
@@ -183,12 +182,12 @@ def calculate_boltzdesign_binder_loss(
     Includes distogram entropy loss and optionally confidence losses (pLDDT, PAE).
 
     Args:
-        partial_result: Dictionary containing model outputs (must include
-                          distogram[logits], predicted_lddt, full_pae).
-        feature_dict: Input feature dictionary.
+        partial_result: Dictionary containing model outputs from a forward pass
+                          (must include distogram[logits], predicted_lddt, full_pae).
+        feature_dict: Feature dictionary *after* being updated by
+                        `binder_utils.update_features_from_logits`.
         target_indices: Indices of target residues.
         binder_indices: Indices of binder residues.
-        seq_representation: Sequence representation used (softmax probs or STE).
         weights_config: LossWeightsConfig object containing loss weights.
         compute_confidence_loss: If True, compute and add pLDDT/PAE losses.
                                    Defaults to True for backward compatibility.
@@ -287,16 +286,6 @@ def calculate_boltzdesign_binder_loss(
         loss_breakdown['plddt_neg_mean'] = 0.0
         loss_breakdown['pae_inter_mean'] = 0.0
         loss_breakdown['confidence_unweighted'] = 0.0
-
-    # --- Sequence Entropy Loss --- 
-    # This is typically added *outside* this function based on the stage (e.g., in BoltzProtocol.loss_fn_for_grad_boltz)
-    # If needed here, requires seq_representation and careful handling
-    # seq_entropy_weight = weights.get("seq_entropy", 0.0)
-    # if seq_entropy_weight > 0:
-    #     # Requires seq_representation (probs)
-    #     seq_ent_loss = loss_utils.get_binder_seq_entropy_loss(seq_representation)
-    #     total_loss += seq_entropy_weight * seq_ent_loss
-    #     loss_breakdown['seq_entropy'] = seq_ent_loss
 
     # --- Helix Loss ---
     w_helix = weights_config.boltz_helix

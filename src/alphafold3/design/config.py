@@ -1,6 +1,9 @@
 import dataclasses
 from typing import List, Dict, Optional, Sequence
 
+# Define alphabet size for standard amino acids
+ALPHABET_SIZE = 20
+
 # Default values primarily derived from flag definitions in run_alphafold.py
 
 @dataclasses.dataclass(frozen=True)
@@ -38,6 +41,15 @@ class BoltzDesignConfig:
     # Contains weights relevant to Boltz protocol
     weights: LossWeightsConfig = dataclasses.field(default_factory=LossWeightsConfig)
 
+    # STE schedule parameters
+    ste_alpha: float = 1.0
+    ste_temp_start: float = 1.0
+    ste_temp_end: float = 0.01 # Needs low temp for STE stage
+    ste_soft_start: float = 0.0
+    ste_soft_end: float = 0.0
+    ste_hard_start: float = 0.0
+    ste_hard_end: float = 1.0 # STE stage is hard
+
 
 @dataclasses.dataclass(frozen=True)
 class GradientDesignConfig:
@@ -46,6 +58,18 @@ class GradientDesignConfig:
     steps: int = 200
     # Contains weights relevant to Gradient protocol
     weights: LossWeightsConfig = dataclasses.field(default_factory=LossWeightsConfig)
+
+    # STE schedule parameters
+    ste_alpha: float = 1.0
+    ste_temp_start: float = 1.0
+    ste_temp_end: float = 0.1 # Ramp down temperature
+    ste_soft_start: float = 1.0 # Start soft
+    ste_soft_end: float = 0.0
+    ste_hard_start: float = 0.0
+    ste_hard_end: float = 1.0 # End hard (STE)
+
+    # Optimizer choice
+    optimizer_name: str = "adam" # Default to adam, read from flag in run_alphafold.py
 
 
 @dataclasses.dataclass(frozen=True)
@@ -61,6 +85,7 @@ class DesignConfig:
     # Common parameters from flags
     learning_rate: float = 0.1  # Default from --design_learning_rate
     clear_memory_interval: int = 0  # Default from --clear_memory_interval
+    optimizer_name: str = "adam"  # Name of optimizer to use for sequence design
 
     # Logging & tracking parameters
     verbosity: int = 1  # How often to print log lines (every N steps)
