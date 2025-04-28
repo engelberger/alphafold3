@@ -383,7 +383,7 @@ class BoltzProtocol(BinderProtocol):
             # Use grad_fn with apo template
             for apo_step in range(num_apo_steps):
                 apo_iter_start_time = time.time()
-                logging.debug(f"  DEBUG: Entering Apo iter {apo_step+1}/{num_apo_steps}") # <<< Start of iteration
+                logging.debug(f"  DEBUG: Entering Apo iter {apo_step+1}/{num_apo_steps}")
                 rng_key, iter_key = jax.random.split(rng_key)
                 try:
                     (loss_val, loss_bd), grads = grad_fn(
@@ -401,6 +401,9 @@ class BoltzProtocol(BinderProtocol):
                         current_opt=self._update_opt_schedule(0, 1, designer_opt),
                         current_bias=bias
                     )
+                    # Log gradient norm to track STE during apo-phase
+                    grad_norm = jnp.linalg.norm(grads)
+                    logging.debug(f"  DEBUG: Apo iter {apo_step+1} gradient norm={safe_jax_to_float(grad_norm)}")
                     updates, current_opt_state = current_optimizer.update(grads, current_opt_state)
                     binder_logits = optax.apply_updates(binder_logits, updates)
                     # Log progress
@@ -482,6 +485,10 @@ class BoltzProtocol(BinderProtocol):
                         inter_k_arg=loss_fn_custom_args.get('inter_k'),
                         inter_l_arg=loss_fn_custom_args.get('inter_l')
                     )
+
+                    # Log gradient norm to track STE gradient flow
+                    grad_norm = jnp.linalg.norm(grads)
+                    logging.debug(f"Iter {current_iter}: Gradient norm={safe_jax_to_float(grad_norm)}")
 
                     if jnp.isnan(loss_val) or jnp.isinf(loss_val):
                         logging.warning(f"Iter {current_iter}: Invalid loss ({loss_val}), skipping update.")

@@ -18,13 +18,13 @@ class LossWeightsConfig:
     # Note: --gradient_contact_weight=0.5 likely maps to inter-contact loss
     # The gradient loss function sums weighted intra and inter. We'll map
     # the flag to inter here and assume intra defaults to 0 unless overridden.
-    gradient_contact_inter: float = 0.5
-    gradient_contact_intra: float = 0.5 # Defaulting to 0 as only one flag exists
+    gradient_contact_inter: float = 0.0
+    gradient_contact_intra: float = 0.0 # Defaulting to 0 as only one flag exists
     gradient_fape_target: float = 0.0 # Hidden parameter, default 0.0
 
     # Boltz Protocol Specific (--boltz_*)
-    boltz_contact_intra: float = 0.5
-    boltz_contact_inter: float = 0.5
+    boltz_contact_intra: float = 0.0
+    boltz_contact_inter: float = 0.0
     boltz_confidence: float = 1.0 # Combined pLDDT + PAE weight
     boltz_helix: float = 0.0 # Placeholder, default 0.0
 
