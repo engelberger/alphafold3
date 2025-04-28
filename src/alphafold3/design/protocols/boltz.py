@@ -9,6 +9,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
+import os
+import matplotlib.pyplot as plt
 import dataclasses
 
 from alphafold3.common import folding_input
@@ -22,6 +24,20 @@ from alphafold3.design.utils import freeze_containers_for_jax, safe_jax_to_float
 from .base import BinderProtocol
 from alphafold3.design.sequence_utils import soft_seq_af3
 from alphafold3.design.config import BoltzDesignConfig, ALPHABET_SIZE
+
+# Helper to plot binder_logits softmax probabilities per step
+def _plot_logits(logits, step, prefix="boltz"):
+    import jax
+    probs = jax.nn.softmax(logits, axis=-1)
+    fig, ax = plt.subplots(figsize=(10, 5))
+    c = ax.imshow(probs.T, aspect='auto', origin='lower')
+    ax.set_xlabel('Binder Position')
+    ax.set_ylabel('AA Index')
+    ax.set_title(f'{prefix} Step {step} Softmax Probabilities')
+    plt.colorbar(c, ax=ax)
+    os.makedirs(f"{prefix}_plots", exist_ok=True)
+    fig.savefig(os.path.join(f"{prefix}_plots", f"{prefix}_step_{step}.png"))
+    plt.close(fig)
 
 class BoltzProtocol(BinderProtocol):
     """Implements the Boltzmann-inspired (BoltzDesign1) binder design protocol."""
@@ -475,8 +491,9 @@ class BoltzProtocol(BinderProtocol):
                     # Let debug log a summary of the update
                     logging.debug(f"Iter {current_iter}: Updating logits with grads shape={grads.shape}")
                     updates, current_opt_state = current_optimizer.update(grads, current_opt_state)
-                    logging.debug(f"Iter {current_iter}: Applying updates to logits")
                     binder_logits = optax.apply_updates(binder_logits, updates)
+                    # Plot binder_logits probabilities at this iteration
+                    _plot_logits(binder_logits, current_iter)
                     logging.debug(f"Iter {current_iter}: Logits updated, new shape={binder_logits.shape}")
 
                     # Log metrics (extract from loss_breakdown)
@@ -534,8 +551,17 @@ class BoltzProtocol(BinderProtocol):
                         best_metrics = log_data # Store the entire log dict as best metrics
                         # Regenerate feature dict for the best logits
                         logging.debug(f"Iter {current_iter}: New best found. Regenerating feature dict.")
+                        # Recompute STE representations for the best logits
+                        best_seq_repr = soft_seq_af3(
+                            best_logits,
+                            bias,
+                            current_opt,
+                            iter_key
+                        )
                         best_feature_dict = binder_utils.update_features_from_logits(
-                             current_template_jax, binder_indices_jnp, best_logits
+                            current_template_jax,
+                            binder_indices_jnp,
+                            best_seq_repr
                         )
                         logging.info(f"Iter {current_iter}: New best {self.config.best_metric}={current_metric_value:.4f}")
 
@@ -567,8 +593,19 @@ class BoltzProtocol(BinderProtocol):
 
         if best_feature_dict is None:
              logging.warning("Regenerating best_feature_dict from best_logits at the end.")
+             # Recompute STE representations for fallback best_logits
+             total_steps = sum(self.config.boltz_config.stages)
+             final_opt = self._update_opt_schedule(total_steps - 1, total_steps, designer_opt)
+             fallback_seq_repr = soft_seq_af3(
+                 best_logits,
+                 bias,
+                 final_opt,
+                 rng_key
+             )
              best_feature_dict = binder_utils.update_features_from_logits(
-                 current_template_jax, binder_indices_jnp, best_logits
+                 current_template_jax,
+                 binder_indices_jnp,
+                 fallback_seq_repr
              )
 
         # Final sequence details
